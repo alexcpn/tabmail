@@ -39,10 +39,9 @@ Haiku (by default) sorts every email into one of those tabs.
                                                                     │ Hi! Are you free…
 ```
 
-- **Read-only by default.** It uses the `gmail.readonly` scope, so it can't
-  send, delete or change anything. Set `allow_changes = true` to have opening
-  an email mark it read, and `D` move it to Trash (`u` undoes it). That asks
-  Google for `gmail.modify` instead. Mail is never deleted permanently or sent.
+- **Changes nothing unless you ask.** By default tabmail only reads. Set
+  `allow_changes = true` to have opening an email mark it read, and `D` move
+  it to Trash (`u` undoes it). Mail is never deleted permanently or sent.
 - **For sorting, only sender and subject go to the AI**, never email bodies.
   Email text is passed as data, and the `claude` CLI runs with no tools.
 - **Summaries on demand.** Press `s` for a short AI summary of the email you're
@@ -51,21 +50,78 @@ Haiku (by default) sorts every email into one of those tabs.
 - **Each email is sorted once.** Results are cached per conversation, so a
   refresh only sends new mail. Edit your config and everything is re-sorted.
 
+## Quick start
+
+You need [uv](https://docs.astral.sh/uv/) and
+[Claude Code](https://claude.com/claude-code) logged in. No Google Cloud
+project is needed.
+
+1. Create a Gmail [app password](https://myaccount.google.com/apppasswords)
+   named "tabmail". This needs [2-Step Verification](https://myaccount.google.com/signinoptions/twosv)
+   turned on.
+2. Get tabmail and start it:
+
+   ```sh
+   git clone https://github.com/alexcpn/tabmail
+   cd tabmail
+   uv run tabmail.py
+   ```
+
+3. When asked, enter your Gmail address and the app password. tabmail checks
+   them and saves them in your system keyring, so you only do this once.
+
+Your inbox opens, sorted into tabs. To make the tabs your own, copy
+`config.example.toml` to `~/.config/tabmail/config.toml` and edit the
+descriptions (see [Your config](#3-your-config)). To start tabmail with the
+Super key or Spotlight, run `./install-launcher.sh`.
+
 ## Setup
 
-### 1. Gmail API access (one time)
+### 1. Sign in to Gmail (pick one)
+
+**Easy: an app password (about 2 minutes, no Google Cloud project).**
+
+1. Turn on [2-Step Verification](https://myaccount.google.com/signinoptions/twosv)
+   for your Google account, if it isn't on already.
+2. Create an [app password](https://myaccount.google.com/apppasswords) named
+   "tabmail".
+3. Run `uv run tabmail.py`. It asks for your Gmail address and the app password,
+   checks them, and saves them in your system keyring (GNOME Keyring, KWallet or
+   the macOS Keychain).
+
+tabmail then reads your mail over IMAP. An app password gives full access to
+your mailbox (it can't be limited to read-only), but tabmail only changes
+anything when `allow_changes = true` and you press the keys for it. To change
+or remove the saved password, run `uv run tabmail.py --setup-imap` or
+`uv run tabmail.py --forget-imap`. Some work or school accounts don't allow app
+passwords; use the option below for those.
+
+**Read-only: your own Google Cloud project (about 15 minutes).**
+
+This uses the Gmail API with read-only access (`gmail.readonly`) unless you
+turn on `allow_changes`.
 
 1. In [Google Cloud Console](https://console.cloud.google.com/), create or pick a project.
 2. **APIs & Services → Library**: enable the **Gmail API**.
-3. **APIs & Services → OAuth consent screen**: choose External, add yourself
-   as a test user, and add the scope `.../auth/gmail.readonly` (plus
-   `.../auth/gmail.modify` if you'll use `allow_changes`).
-4. **APIs & Services → Credentials → Create credentials → OAuth client ID**:
-   choose **Desktop app** and download the JSON file.
-5. Save it as `~/.config/tabmail/credentials.json`.
+3. **Google Auth Platform → Branding**: fill in the app name, a home page and
+   a privacy policy link (this repository and its `PRIVACY.md` work), and add
+   the domain under **Authorized domains**.
+4. **Google Auth Platform → Data Access**: add the scope
+   `.../auth/gmail.readonly` (plus `.../auth/gmail.modify` if you'll use
+   `allow_changes`).
+5. **Google Auth Platform → Clients → Create client**: choose **Desktop app**
+   and download the JSON file. Save it as `~/.config/tabmail/credentials.json`.
+6. **Google Auth Platform → Audience**: click **Publish app**. In "Testing"
+   mode, Google signs you out every 7 days.
 
-On the first run a browser window opens so you can sign in. The token is saved
-to `~/.config/tabmail/token.json` (mode 600).
+On the first run a browser window opens so you can sign in. Google warns that
+it "hasn't verified this app": that's expected for your own project. Click
+**Advanced → Go to tabmail (unsafe)**. The token is saved to
+`~/.config/tabmail/token.json` (mode 600).
+
+tabmail picks the method automatically: a saved app password first, then a
+Google Cloud client if `credentials.json` exists, otherwise it asks for an app
+password. Set `auth = "imap"` or `auth = "google-api"` in your config to choose.
 
 ### 2. An AI backend
 
@@ -152,7 +208,8 @@ to your `config.toml`, and re-sorts everything so the new tab can pick up mail.
 | Path | What |
 |---|---|
 | `~/.config/tabmail/config.toml` | your tabs and instructions |
-| `~/.config/tabmail/credentials.json` | your Google OAuth client (never commit it) |
+| system keyring, entry "tabmail" | your Gmail address and app password (IMAP sign-in) |
+| `~/.config/tabmail/credentials.json` | your Google OAuth client, if you use one (never commit it) |
 | `~/.config/tabmail/token.json` | your Gmail sign-in token |
 | `~/.config/tabmail/corrections.json` | your manual moves and notes for the AI |
 | `~/.cache/tabmail/ai_tabs.json` | cached AI sorting results |
@@ -161,7 +218,7 @@ to your `config.toml`, and re-sorts everything so the new tab can pick up mail.
 
 ```sh
 uv run --with pytest --with textual --with google-api-python-client \
-  --with google-auth-oauthlib --with anthropic pytest -q tests
+  --with google-auth-oauthlib --with anthropic --with keyring pytest -q tests
 ```
 
 The tests run offline and don't call Gmail or any AI.

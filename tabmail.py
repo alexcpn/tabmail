@@ -5,6 +5,7 @@
 #   "google-api-python-client>=2.100",
 #   "google-auth-oauthlib>=1.2",
 #   "anthropic>=0.70",
+#   "keyring>=24",
 # ]
 # ///
 """tabmail: a read-only, tabbed Gmail inbox for the terminal.
@@ -19,7 +20,13 @@ Run:  uv run tabmail.py
 from __future__ import annotations
 
 import base64
+import email
+import email.policy
 import email.utils
+import getpass
+import imaplib
+import threading
+import time
 import hashlib
 import json
 import os
@@ -105,6 +112,7 @@ class Config:
     default_tab: str = ""    # where mail goes when the AI is off or fails
     allow_changes: bool = False  # mark read on open, D moves to Trash
     summaries: bool = True       # s: send the current email's text to the AI for a summary
+    auth: str = "auto"           # auto | imap | google-api
     source: str = ""         # the raw config text (AI cache is keyed on it)
 
     @property
@@ -145,6 +153,7 @@ def load_config(path: Path | None = None) -> Config:
         default_tab=s.get("default_tab", ""),
         allow_changes=bool(s.get("allow_changes", False)),
         summaries=bool(s.get("summaries", True)),
+        auth=s.get("auth", "auto"),
         source=text,
     )
 
@@ -478,6 +487,8 @@ def new_service(creds, timeout: float):
 
 
 def fetch_mails(svc, query: str, limit: int) -> list[Mail]:
+    if isinstance(svc, ImapAccount):
+        return svc.fetch_mails(query, limit)
     ids: list[dict] = []
     req = svc.users().messages().list(userId="me", q=query, maxResults=min(limit, 500))
     while req is not None and len(ids) < limit:
@@ -573,24 +584,30 @@ def _find_part(payload: dict, mime: str) -> str | None:
 
 def fetch_body(svc, thread_id: str) -> tuple[str, str]:
     """Header line + plain-text body of the newest message in a thread.
-    Read-only: fetching via the API does not mark the mail as read."""
+    Read-only: fetching does not mark the mail as read."""
+    if isinstance(svc, ImapAccount):
+        return svc.fetch_body(thread_id)
     thread = svc.users().threads().get(userId="me", id=thread_id, format="full").execute()
     msg = thread["messages"][-1]
     h = {x["name"].lower(): x["value"] for x in msg["payload"].get("headers", [])}
     header = f"From: {h.get('from', '')}\nDate: {h.get('date', '')}\nSubject: {h.get('subject', '')}"
     if len(thread["messages"]) > 1:
         header += f"\n({len(thread['messages'])} messages in thread, showing the latest)"
-    text = _find_part(msg["payload"], "text/plain")
-    if not text:
-        html = _find_part(msg["payload"], "text/html")
-        if html:
-            p = _HTMLText()
-            p.feed(html[:MAX_HTML_CHARS])  # huge table-heavy mails parse slowly
-            text = p.text()
-    text = (text or msg.get("snippet", "(no text body)")).strip()
+    plain = _find_part(msg["payload"], "text/plain")
+    html = None if plain else _find_part(msg["payload"], "text/html")
+    return header, _body_text(plain, html, msg.get("snippet", "(no text body)"))
+
+
+def _body_text(plain: str | None, html: str | None, fallback: str) -> str:
+    text = plain
+    if not text and html:
+        p = _HTMLText()
+        p.feed(html[:MAX_HTML_CHARS])  # huge table-heavy mails parse slowly
+        text = p.text()
+    text = (text or fallback).strip()
     if len(text) > MAX_BODY_CHARS:
         text = text[:MAX_BODY_CHARS] + "\n\n… (truncated; press o to open in Gmail)"
-    return header, text
+    return text
 
 
 def _batch_threads(svc, method: str, thread_ids: list[str]) -> list[str]:
@@ -613,20 +630,365 @@ def _batch_threads(svc, method: str, thread_ids: list[str]) -> list[str]:
 
 def trash_threads(svc, thread_ids: list[str]) -> list[str]:
     """Move threads to Trash (recoverable for 30 days). Returns failed ids."""
+    if isinstance(svc, ImapAccount):
+        return svc.trash_threads(thread_ids)
     return _batch_threads(svc, "trash", thread_ids)
 
 
 def untrash_threads(svc, thread_ids: list[str]) -> list[str]:
+    if isinstance(svc, ImapAccount):
+        return svc.untrash_threads(thread_ids)
     return _batch_threads(svc, "untrash", thread_ids)
 
 
 def mark_thread_read(svc, thread_id: str) -> None:
+    if isinstance(svc, ImapAccount):
+        return svc.mark_thread_read(thread_id)
     svc.users().threads().modify(
         userId="me", id=thread_id, body={"removeLabelIds": ["UNREAD"]}
     ).execute()
 
 
 # ---------------------------------------------------------------- ui
+
+# ---------------------------------------------------------------- imap (app password)
+#
+# Gmail over IMAP with an app password: no Google Cloud project needed.
+# Gmail's IMAP extensions give us what the API does: X-GM-RAW (Gmail search
+# syntax), X-GM-THRID (thread id; in hex it equals the API/web thread id) and
+# X-GM-LABELS.
+
+IMAP_HOST = "imap.gmail.com"
+KEYRING_SERVICE = "tabmail"
+KEYRING_ACCOUNT_KEY = "imap-account"   # keyring entry holding the Gmail address
+IMAP_FALLBACK_FILE = CONFIG_DIR / "imap.json"
+IMAP_BODY_BYTES = 2_000_000            # cap per message fetch (attachments can be huge)
+IMAP_HEADER_FIELDS = "FROM SUBJECT DATE LIST-UNSUBSCRIBE LIST-ID PRECEDENCE"
+_IMAP_LABELS = {"\\Inbox": "INBOX", "\\Important": "IMPORTANT", "\\Starred": "STARRED",
+                "\\Sent": "SENT"}
+_IMAP_CATEGORIES = ("promotions", "updates", "social", "forums")
+
+
+def _imap_quote(s: str) -> str:
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _imap_paren_list(meta: str, key: str) -> list[str]:
+    """Items of `KEY (a "b c" \\d)` in an IMAP FETCH response, unquoted."""
+    i = meta.find(key + " (")
+    if i < 0:
+        return []
+    i += len(key) + 2
+    items, cur, quoted, esc = [], "", False, False
+    while i < len(meta):
+        ch = meta[i]
+        if esc:
+            cur += ch
+            esc = False
+        elif ch == "\\" and quoted:
+            esc = True
+        elif ch == '"':
+            quoted = not quoted
+        elif ch == ")" and not quoted:
+            break
+        elif ch == " " and not quoted:
+            if cur:
+                items.append(cur)
+            cur = ""
+        else:
+            cur += ch
+        i += 1
+    if cur:
+        items.append(cur)
+    return items
+
+
+def _imap_fetch_items(data) -> list[tuple[str, bytes]]:
+    """imaplib FETCH data -> [(metadata text, literal payload bytes)]."""
+    out = []
+    for item in data or []:
+        if isinstance(item, tuple) and len(item) >= 2:
+            out.append((item[0].decode("utf-8", "replace"), item[1] or b""))
+    return out
+
+
+def _headers_of(raw: bytes) -> dict[str, str]:
+    msg = email.message_from_bytes(raw, policy=email.policy.default)
+    return {k.lower(): str(v) for k, v in msg.items()}
+
+
+class ImapAccount:
+    """A Gmail account over IMAP. Each thread gets its own connection
+    (imaplib isn't thread-safe), created on first use."""
+
+    def __init__(self, user: str, password: str, timeout: float = 20) -> None:
+        self.user, self.password, self.timeout = user, password, timeout
+        self.email = user.lower()
+        self._local = threading.local()
+        self._folders: dict[str, str] | None = None
+
+    # -- connection
+    def _connect(self):
+        conn = imaplib.IMAP4_SSL(IMAP_HOST, 993, timeout=self.timeout)
+        conn.login(self.user, self.password)
+        return conn
+
+    def conn(self):
+        c = getattr(self._local, "conn", None)
+        if c is None:
+            c = self._local.conn = self._connect()
+        return c
+
+    def _run(self, fn):
+        """Run fn(conn); on a dropped connection, reconnect once and retry."""
+        try:
+            return fn(self.conn())
+        except (imaplib.IMAP4.abort, OSError):
+            self._local.conn = None
+            return fn(self.conn())
+
+    def folders(self, conn) -> dict[str, str]:
+        """Special-use folder names (they're localized, e.g. [Google Mail]/...)."""
+        if self._folders is None:
+            found = {"all": "[Gmail]/All Mail", "trash": "[Gmail]/Trash"}
+            _, lines = conn.list()
+            for line in lines or []:
+                text = line.decode("utf-8", "replace") if isinstance(line, bytes) else str(line)
+                m = re.match(r'\((?P<flags>[^)]*)\) "[^"]*" (?P<name>.+)$', text)
+                if not m:
+                    continue
+                name = m.group("name").strip()
+                if name.startswith('"') and name.endswith('"'):
+                    name = name[1:-1].replace('\\"', '"').replace("\\\\", "\\")
+                flags = m.group("flags")
+                if "\\All" in flags:
+                    found["all"] = name
+                elif "\\Trash" in flags:
+                    found["trash"] = name
+            self._folders = found
+        return self._folders
+
+    def _select(self, conn, which: str, readonly: bool) -> None:
+        typ, data = conn.select(_imap_quote(self.folders(conn)[which]), readonly=readonly)
+        if typ != "OK":
+            raise RuntimeError(f"cannot open {which} mail folder: {data}")
+
+    @staticmethod
+    def _search(conn, *criteria) -> list[int]:
+        typ, data = conn.uid("SEARCH", *criteria)
+        if typ != "OK":
+            raise RuntimeError(f"IMAP search failed: {data}")
+        return [int(x) for x in (data[0] or b"").split()]
+
+    def _thread_uids(self, conn, thread_id: str) -> list[int]:
+        return self._search(conn, "X-GM-THRID", str(int(thread_id, 16)))
+
+    # -- reading
+    def fetch_mails(self, query: str, limit: int) -> list[Mail]:
+        def go(conn):
+            self._select(conn, "all", readonly=True)
+            uids = self._search(conn, "X-GM-RAW", _imap_quote(query))[-limit:]
+            if not uids:
+                return []
+            wanted = set(uids)
+            cats: dict[int, set[str]] = {}
+            for cat in _IMAP_CATEGORIES:  # IMAP doesn't expose Gmail's category tabs; ask
+                for u in self._search(conn, "X-GM-RAW", _imap_quote(f"({query}) category:{cat}")):
+                    if u in wanted:
+                        cats.setdefault(u, set()).add(f"CATEGORY_{cat.upper()}")
+            rows = []
+            for i in range(0, len(uids), 200):
+                part = ",".join(str(u) for u in uids[i : i + 200])
+                typ, data = conn.uid(
+                    "FETCH", part,
+                    f"(UID X-GM-THRID X-GM-LABELS FLAGS INTERNALDATE "
+                    f"BODY.PEEK[HEADER.FIELDS ({IMAP_HEADER_FIELDS})])",
+                )
+                if typ != "OK":
+                    raise RuntimeError(f"IMAP fetch failed: {data}")
+                rows.extend(_imap_fetch_items(data))
+            return [self._mail_from(meta, raw, cats) for meta, raw in rows]
+
+        latest: dict[str, Mail] = {}  # one row per thread, newest message wins
+        for mail in self._run(go):
+            if mail is None:
+                continue
+            prev = latest.get(mail.thread_id)
+            if prev is None or (mail.when and prev.when and mail.when > prev.when):
+                latest[mail.thread_id] = mail
+        return sorted(latest.values(), key=lambda m: m.when or datetime.min, reverse=True)
+
+    @staticmethod
+    def _mail_from(meta: str, raw: bytes, cats: dict[int, set[str]]) -> Mail | None:
+        thr = re.search(r"X-GM-THRID (\d+)", meta)
+        uid = re.search(r"UID (\d+)", meta)
+        if not thr or not uid:
+            return None
+        h = _headers_of(raw)
+        name, addr = email.utils.parseaddr(h.get("from", ""))
+        labels = {_IMAP_LABELS[x] for x in _imap_paren_list(meta, "X-GM-LABELS") if x in _IMAP_LABELS}
+        if "\\Seen" not in _imap_paren_list(meta, "FLAGS"):
+            labels.add("UNREAD")
+        labels |= cats.get(int(uid.group(1)), set())
+        t = imaplib.Internaldate2tuple(meta.encode())
+        return Mail(
+            thread_id=format(int(thr.group(1)), "x"),
+            sender_name=name or addr,
+            sender_addr=addr,
+            subject=" ".join(h.get("subject", "(no subject)").split()) or "(no subject)",
+            when=datetime.fromtimestamp(time.mktime(t)) if t else None,
+            labels=labels,
+            bulk=is_bulk(h, addr),
+        )
+
+    def fetch_body(self, thread_id: str) -> tuple[str, str]:
+        def go(conn):
+            self._select(conn, "all", readonly=True)
+            uids = self._thread_uids(conn, thread_id)
+            if not uids:
+                raise RuntimeError("this conversation is no longer in your mailbox")
+            # BODY.PEEK doesn't set \Seen: reading here never marks mail read by itself
+            typ, data = conn.uid("FETCH", str(max(uids)), f"(BODY.PEEK[]<0.{IMAP_BODY_BYTES}>)")
+            items = _imap_fetch_items(data)
+            if typ != "OK" or not items:
+                raise RuntimeError(f"IMAP fetch failed: {data}")
+            return len(uids), items[0][1]
+
+        count, raw = self._run(go)
+        msg = email.message_from_bytes(raw, policy=email.policy.default)
+        header = f"From: {msg.get('from', '')}\nDate: {msg.get('date', '')}\nSubject: {msg.get('subject', '')}"
+        if count > 1:
+            header += f"\n({count} messages in thread, showing the latest)"
+        plain = html = None
+        for part in msg.walk():
+            if part.is_multipart() or part.get_content_disposition() == "attachment":
+                continue
+            ctype = part.get_content_type()
+            try:
+                if ctype == "text/plain" and plain is None:
+                    plain = part.get_content()
+                elif ctype == "text/html" and html is None:
+                    html = part.get_content()
+            except (LookupError, ValueError):  # unknown charset or broken part
+                continue
+        return header, _body_text(plain, html, "(no text body)")
+
+    # -- changes
+    def mark_thread_read(self, thread_id: str) -> None:
+        def go(conn):
+            self._select(conn, "all", readonly=False)
+            uids = self._thread_uids(conn, thread_id)
+            if uids:
+                conn.uid("STORE", ",".join(map(str, uids)), "+FLAGS", "(\\Seen)")
+        self._run(go)
+
+    def _move_threads(self, source: str, dest: str, thread_ids: list[str]) -> list[str]:
+        def go(conn):
+            self._select(conn, source, readonly=False)
+            target = "INBOX" if dest == "inbox" else _imap_quote(self.folders(conn)[dest])
+            failed = []
+            for tid in thread_ids:
+                uids = self._thread_uids(conn, tid)
+                typ, _ = conn.uid("MOVE", ",".join(map(str, uids)), target) if uids else ("NO", None)
+                if typ != "OK":
+                    failed.append(tid)
+            return failed
+        return self._run(go)
+
+    def trash_threads(self, thread_ids: list[str]) -> list[str]:
+        return self._move_threads("all", "trash", thread_ids)
+
+    def untrash_threads(self, thread_ids: list[str]) -> list[str]:
+        # Gmail's IMAP Trash drops other labels; undo puts mail back in the Inbox
+        return self._move_threads("trash", "inbox", thread_ids)
+
+
+def imap_saved_login() -> tuple[str, str] | None:
+    """(address, app password) from env vars, the system keyring, or the
+    fallback file, in that order."""
+    user = os.environ.get("TABMAIL_IMAP_USER")
+    pw = os.environ.get("TABMAIL_IMAP_PASSWORD")
+    if user and pw:
+        return user, pw
+    try:
+        import keyring
+
+        user = keyring.get_password(KEYRING_SERVICE, KEYRING_ACCOUNT_KEY)
+        pw = keyring.get_password(KEYRING_SERVICE, user) if user else None
+        if user and pw:
+            return user, pw
+    except Exception:
+        pass
+    try:
+        data = json.loads(IMAP_FALLBACK_FILE.read_text())
+        return data["email"], data["password"]
+    except (OSError, ValueError, KeyError):
+        return None
+
+
+def imap_save_login(user: str, pw: str) -> str:
+    """Store in the system keyring; if there is none, in a 0600 file."""
+    try:
+        import keyring
+
+        keyring.set_password(KEYRING_SERVICE, KEYRING_ACCOUNT_KEY, user)
+        keyring.set_password(KEYRING_SERVICE, user, pw)
+        return "your system keyring"
+    except Exception:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        IMAP_FALLBACK_FILE.touch(mode=0o600)
+        IMAP_FALLBACK_FILE.chmod(0o600)
+        IMAP_FALLBACK_FILE.write_text(json.dumps({"email": user, "password": pw}))
+        return str(IMAP_FALLBACK_FILE)
+
+
+def imap_forget_login() -> None:
+    saved = imap_saved_login()
+    try:
+        import keyring
+
+        if saved:
+            keyring.delete_password(KEYRING_SERVICE, saved[0])
+        keyring.delete_password(KEYRING_SERVICE, KEYRING_ACCOUNT_KEY)
+    except Exception:
+        pass
+    IMAP_FALLBACK_FILE.unlink(missing_ok=True)
+
+
+def imap_setup() -> ImapAccount:
+    """Ask for the Gmail address and app password in the terminal, check them
+    by logging in, and save them."""
+    print(
+        "tabmail signs in to Gmail with an app password (no Google Cloud project needed).\n\n"
+        "  1. Turn on 2-Step Verification:  https://myaccount.google.com/signinoptions/twosv\n"
+        "  2. Create an app password named \"tabmail\":  https://myaccount.google.com/apppasswords\n"
+        "  3. Paste it below. It is stored in your system keyring, not in a plain file.\n"
+    )
+    for attempt in range(3):
+        user = input("Gmail address: ").strip()
+        pw = getpass.getpass("App password (16 letters; spaces are fine): ").replace(" ", "")
+        try:
+            account = ImapAccount(user, pw)
+            account.conn()
+        except Exception as e:
+            print(f"Could not sign in: {e}\n"
+                  "Check the address and app password, and that IMAP is on in Gmail settings.\n")
+            continue
+        where = imap_save_login(user, pw)
+        print(f"Signed in. Saved to {where}.\n")
+        return account
+    raise SystemExit("Gave up after 3 attempts.")
+
+
+def resolve_auth(cfg: Config) -> str:
+    """'google-api' or 'imap'. auto: IMAP if you saved an app password; else the
+    Google API if you set up a Google Cloud client; else IMAP (asks to set up)."""
+    if cfg.auth in ("google-api", "imap"):
+        return cfg.auth
+    if imap_saved_login():
+        return "imap"
+    return "google-api" if (CLIENT_SECRET.exists() or TOKEN_FILE.exists()) else "imap"
+
 
 def fmt_when(d: datetime | None) -> str:
     if d is None:
@@ -742,8 +1104,9 @@ class TabMail(App):
         Binding("ctrl+c", "quit", "Quit", show=False, priority=True),
     ]
 
-    def __init__(self, creds=None) -> None:
+    def __init__(self, creds=None, imap: "ImapAccount | None" = None) -> None:
         super().__init__()
+        self.imap = imap
         self.cfg = load_config()
         self.tabs = self.cfg.tabs
         self.backend = pick_backend(self.cfg)
@@ -791,7 +1154,9 @@ class TabMail(App):
     @work(thread=True, exclusive=True)
     def load(self) -> None:
         try:
-            if self.svc is None:
+            if self.svc is None and self.imap is not None:
+                self.svc, self.me = self.imap, self.imap.email
+            elif self.svc is None:
                 self.creds = self.creds or gmail_creds(self.cfg.allow_changes)
                 self.svc = new_service(self.creds, timeout=30)
                 self.me = self.svc.users().getProfile(userId="me").execute()["emailAddress"].lower()
@@ -957,6 +1322,8 @@ class TabMail(App):
         self.call_from_thread(self.show_body, title, text, key)
 
     def _body_service(self):
+        if isinstance(self.svc, ImapAccount):
+            return self.svc  # one IMAP connection per worker thread, made on demand
         return new_service(self.creds, timeout=BODY_TIMEOUT - 5) if self.creds else self.svc
 
     @work(thread=True, exclusive=True, group="body")
@@ -1188,12 +1555,36 @@ class TabMail(App):
         self._switch(-1)
 
 
+USAGE = """usage: tabmail.py [--setup-imap | --forget-imap]
+
+  --setup-imap   sign in with a Gmail app password (asks for it again)
+  --forget-imap  remove the saved app password
+"""
+
+
 def main() -> None:
-    # Sign in before the TUI takes over the screen: a first sign-in (or one
-    # for broader access) opens a browser and prints a link.
-    creds = gmail_creds(load_config().allow_changes)
+    args = sys.argv[1:]
+    if args and args[0] in ("-h", "--help"):
+        print(USAGE)
+        return
+    if args == ["--forget-imap"]:
+        imap_forget_login()
+        print("Removed the saved Gmail app password.")
+        return
+    if args and args != ["--setup-imap"]:
+        raise SystemExit(USAGE)
+
+    # Sign in before the TUI takes over the screen: it may open a browser
+    # (Google API) or ask for an app password (IMAP).
+    cfg = load_config()
+    creds = imap = None
+    if args == ["--setup-imap"] or resolve_auth(cfg) == "imap":
+        saved = None if args else imap_saved_login()
+        imap = ImapAccount(*saved) if saved else imap_setup()
+    else:
+        creds = gmail_creds(cfg.allow_changes)
     try:
-        TabMail(creds).run()  # restores the terminal when it returns
+        TabMail(creds, imap).run()  # restores the terminal when it returns
     finally:
         for proc in list(CHILDREN):
             proc.kill()

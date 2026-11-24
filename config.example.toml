@@ -23,6 +23,10 @@ ai = "auto"            # auto | claude-cli | anthropic-api | off
                        #   auto:          claude-cli if installed, else the API if a key is set
 model = "haiku"        # fast and cheap; "sonnet" or a full model id also work
 default_tab = "Other"  # where mail goes when the AI is off or unavailable
+auth = "auto"          # how to sign in to Gmail: auto | imap | google-api
+                       #   imap:       an app password (run: uv run tabmail.py --setup-imap)
+                       #   google-api: your own Google Cloud project (read-only by default)
+                       #   auto:       a saved app password, else credentials.json, else asks
 allow_changes = false   # true: opening an email marks it read in Gmail, D moves it to
                        # Trash (u undoes). Asks Google for gmail.modify instead of
                        # read-only access, so you sign in again once. Never deletes permanently.

@@ -426,3 +426,151 @@ def test_arrows_do_not_load_mail(monkeypatch, tmp_path):
             assert fetched == ["t0", "t2"]                     # loads only on Enter
 
     asyncio.run(run())
+
+
+# ---------------------------------------------------------------- IMAP (fake server)
+
+import email.utils as _eu  # noqa: E402
+
+
+class FakeImap:
+    """Just enough of Gmail's IMAP (with X-GM extensions) for tabmail."""
+
+    def __init__(self, msgs):
+        self.msgs = msgs              # uid -> dict(thrid, labels, flags, date, raw, folder, cats)
+        self.folder = None
+
+    def list(self):
+        return "OK", [b'(\\HasNoChildren) "/" "INBOX"',
+                      b'(\\All \\HasNoChildren) "/" "[Google Mail]/All Mail"',
+                      b'(\\HasNoChildren \\Trash) "/" "[Google Mail]/Bin"']
+
+    def select(self, name, readonly=False):
+        self.folder = {'"[Google Mail]/All Mail"': "all", '"[Google Mail]/Bin"': "trash"}[name]
+        return "OK", [b"1"]
+
+    def _here(self):
+        return {u: m for u, m in self.msgs.items() if m["folder"] == self.folder}
+
+    def uid(self, cmd, *args):
+        here = self._here()
+        if cmd == "SEARCH":
+            key, val = args
+            if key == "X-GM-THRID":
+                hits = [u for u, m in here.items() if m["thrid"] == int(val)]
+            else:  # X-GM-RAW
+                cat = val.split("category:")[1].strip('"') if "category:" in val else None
+                hits = [u for u, m in here.items() if cat is None or cat in m["cats"]]
+            return "OK", [" ".join(map(str, sorted(hits))).encode()]
+        if cmd == "FETCH":
+            out = []
+            for u in map(int, args[0].split(",")):
+                m = here[u]
+                # real Gmail sends system labels as atoms (\Inbox) or quoted with
+                # an escaped backslash ("\\Important"); send both forms
+                labels = " ".join(
+                    l if n % 2 == 0 else '"' + l.replace("\\", "\\\\") + '"'
+                    for n, l in enumerate(m["labels"]))
+                flags = " ".join(m["flags"])
+                meta = (f'{u} (UID {u} X-GM-THRID {m["thrid"]} X-GM-LABELS ({labels}) '
+                        f'FLAGS ({flags}) INTERNALDATE "{m["date"]}" BODY[] {{{len(m["raw"])}}}')
+                out += [(meta.encode(), m["raw"]), b")"]
+            return "OK", out
+        if cmd == "STORE":
+            for u in map(int, args[0].split(",")):
+                self.msgs[u]["flags"].add("\\Seen")
+            return "OK", [b""]
+        if cmd == "MOVE":
+            dest = "trash" if "Bin" in args[1] else "inbox-restored"
+            for u in map(int, args[0].split(",")):
+                self.msgs[u]["folder"] = "all" if dest != "trash" else "trash"
+            return "OK", [b""]
+        raise AssertionError(cmd)
+
+
+def _raw(frm, subj, body, extra=""):
+    return (f"From: {frm}\r\nSubject: {subj}\r\nDate: Mon, 24 Nov 2026 10:00:00 +0000\r\n{extra}"
+            f"Content-Type: text/plain; charset=utf-8\r\n\r\n{body}\r\n").encode()
+
+
+@pytest.fixture
+def imap_account(monkeypatch):
+    msgs = {
+        1: dict(thrid=0x1A20, labels=["\\Inbox"], flags=set(), date="23-Nov-2026 09:00:00 +0000",
+                raw=_raw("Priya <priya@gmail.com>", "Dinner?", "Free on Saturday?"),
+                folder="all", cats=set()),
+        2: dict(thrid=0x1A20, labels=["\\Inbox", "\\Important"], flags={"\\Seen"},
+                date="24-Nov-2026 09:00:00 +0000",
+                raw=_raw("Priya <priya@gmail.com>", "Re: Dinner?", "Great, 8pm!"),
+                folder="all", cats=set()),
+        3: dict(thrid=0x2B30, labels=["\\Inbox"], flags=set(), date="24-Nov-2026 08:00:00 +0000",
+                raw=_raw("Shop <deals@shop.com>", "=?utf-8?q?50=25_off?=", "Sale!",
+                         "List-Unsubscribe: <mailto:u@shop.com>\r\n"),
+                folder="all", cats={"promotions"}),
+    }
+    fake = FakeImap(msgs)
+    acct = g.ImapAccount("me@gmail.com", "pw")
+    monkeypatch.setattr(acct, "_connect", lambda: fake)
+    return acct, msgs
+
+
+def test_imap_list_threads_labels_and_categories(imap_account):
+    acct, _ = imap_account
+    mails = g.fetch_mails(acct, "in:inbox newer_than:7d", 300)
+    assert [m.thread_id for m in mails] == ["1a20", "2b30"]   # hex thread ids, newest first
+    dinner, shop = mails
+    assert dinner.subject == "Re: Dinner?"                     # newest message of the thread
+    assert dinner.labels == {"INBOX", "IMPORTANT"}             # read, important
+    assert shop.subject == "50% off"                           # RFC 2047 decoded
+    assert shop.labels == {"INBOX", "UNREAD", "CATEGORY_PROMOTIONS"} and shop.bulk
+
+
+def test_imap_body_mark_read_trash_undo(imap_account):
+    acct, msgs = imap_account
+    header, body = g.fetch_body(acct, "1a20")
+    assert "Re: Dinner?" in header and "2 messages in thread" in header and body == "Great, 8pm!"
+    assert "\\Seen" not in msgs[1]["flags"]                    # reading alone changes nothing
+    g.mark_thread_read(acct, "1a20")
+    assert "\\Seen" in msgs[1]["flags"] and "\\Seen" in msgs[2]["flags"]
+    assert g.trash_threads(acct, ["2b30", "ffff"]) == ["ffff"]  # unknown thread reported
+    assert msgs[3]["folder"] == "trash"
+    assert [m.thread_id for m in g.fetch_mails(acct, "in:inbox", 300)] == ["1a20"]
+    assert g.untrash_threads(acct, ["2b30"]) == [] and msgs[3]["folder"] == "all"
+
+
+def test_imap_folder_names_are_discovered(imap_account):
+    acct, _ = imap_account
+    assert acct.folders(acct.conn()) == {"all": "[Google Mail]/All Mail", "trash": "[Google Mail]/Bin"}
+
+
+def test_resolve_auth(cfg, monkeypatch, tmp_path):
+    monkeypatch.setattr(g, "CLIENT_SECRET", tmp_path / "credentials.json")
+    monkeypatch.setattr(g, "TOKEN_FILE", tmp_path / "token.json")
+    monkeypatch.setattr(g, "imap_saved_login", lambda: None)
+    assert g.resolve_auth(cfg) == "imap"                       # nothing set up: easy path
+    (tmp_path / "credentials.json").write_text("{}")
+    assert g.resolve_auth(cfg) == "google-api"
+    monkeypatch.setattr(g, "imap_saved_login", lambda: ("a@gmail.com", "pw"))
+    assert g.resolve_auth(cfg) == "imap"                       # a saved app password wins
+    cfg.auth = "google-api"
+    assert g.resolve_auth(cfg) == "google-api"                 # explicit setting wins
+
+
+def test_imap_login_storage_falls_back_to_private_file(monkeypatch, tmp_path):
+    import builtins
+    real_import = builtins.__import__
+
+    def no_keyring(name, *a, **k):
+        if name == "keyring":
+            raise ImportError("no keyring")
+        return real_import(name, *a, **k)
+
+    monkeypatch.setattr(builtins, "__import__", no_keyring)
+    monkeypatch.setattr(g, "CONFIG_DIR", tmp_path)
+    monkeypatch.setattr(g, "IMAP_FALLBACK_FILE", tmp_path / "imap.json")
+    monkeypatch.delenv("TABMAIL_IMAP_USER", raising=False)
+    where = g.imap_save_login("a@gmail.com", "abcd")
+    assert where.endswith("imap.json") and oct((tmp_path / "imap.json").stat().st_mode)[-3:] == "600"
+    assert g.imap_saved_login() == ("a@gmail.com", "abcd")
+    g.imap_forget_login()
+    assert g.imap_saved_login() is None

@@ -5,17 +5,18 @@ Its author runs no servers and collects no data.
 
 ## What tabmail accesses
 
-With your permission, tabmail uses the Gmail API to read the messages in your
-mailbox: senders, subjects, dates, labels and, when you open or summarize an
-email, its text. If you turn on `allow_changes`, it can also mark emails as
+With your permission, tabmail uses the Gmail API, or Gmail's IMAP service
+with an app password you create, to read the messages in your mailbox:
+senders, subjects, dates, labels and, when you open or summarize an email,
+its text. If you turn on `allow_changes`, it can also mark emails as
 read and move them to Trash when you press the keys for that. It never sends
 email or deletes anything permanently.
 
 ## Where your data goes
 
 - **Your computer.** Your Google sign-in token, settings and corrections are
-  stored in `~/.config/tabmail/`, and cached sorting results in
-  `~/.cache/tabmail/`. Email text is not written to disk.
+  stored in `~/.config/tabmail/`, an app password in your system keyring, and
+  cached sorting results in `~/.cache/tabmail/`. Email text is not written to disk.
 - **The AI you configure.** To sort mail, tabmail sends each email's sender,
   subject and a few Gmail labels to the AI backend you set up (by default the
   Claude Code CLI on your machine, which uses your own Claude account). When
@@ -30,8 +31,10 @@ including the Limited Use requirements.
 
 ## Removing access
 
-Delete `~/.config/tabmail/` and `~/.cache/tabmail/`, and revoke tabmail's
-access at <https://myaccount.google.com/permissions>.
+Delete `~/.config/tabmail/` and `~/.cache/tabmail/`, run
+`uv run tabmail.py --forget-imap`, and revoke tabmail's access at
+<https://myaccount.google.com/permissions> (Google API) or delete its app
+password at <https://myaccount.google.com/apppasswords> (IMAP).
 
 ## Contact
 
