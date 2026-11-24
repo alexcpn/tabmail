@@ -1078,7 +1078,7 @@ class MoveDialog(ModalScreen[dict | None]):
 
 
 class TabMail(App):
-    TITLE = "Gmail"
+    TITLE = "tabmail"
     CSS = """
     DataTable { height: 1fr; }
     #tabs { width: 1fr; }

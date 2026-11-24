@@ -36,13 +36,9 @@ A keyboard-driven terminal app. A tab is just a name and a description, such
 as "Important: written to me by a real person, or needs me to act". Claude
 Haiku (by default) sorts every email into one of those tabs.
 
-```
- Important (4, 2●) │ Notifications (31) │ Jobs (12) │ News (40) │ Other (3)
- ● Priya             Dinner on Saturday?                      14:02 │ From: Priya <…>
- ● Electricity Board Your bill of Rs 3,420 is due on 28 Nov   09:15 │ Subject: Dinner on Saturday?
-   Me                Portfolio: close of 20 Nov               23 Nov │
-                                                                    │ Hi! Are you free…
-```
+![tabmail: an inbox sorted into Important, Notifications, Jobs and News tabs, with an AI summary of a bill in the side panel](docs/screenshot.svg)
+
+*Demo data. The side panel shows the summary you get by pressing `s`.*
 
 - **Changes nothing unless you ask.** By default tabmail only reads. Set
   `allow_changes = true` to have opening an email mark it read, and `D` move
