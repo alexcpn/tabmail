@@ -408,3 +408,21 @@ def test_summaries_can_be_turned_off(monkeypatch, tmp_path):
             assert not app.query_one("#preview-pane").has_class("open")
 
     asyncio.run(run())
+
+
+def test_arrows_do_not_load_mail(monkeypatch, tmp_path):
+    app, calls = _ui_app(monkeypatch, tmp_path, allow_changes=True)
+    fetched = []
+    monkeypatch.setattr(g, "fetch_body", lambda svc, tid: fetched.append(tid) or ("h", "body " + tid))
+
+    async def run():
+        async with app.run_test(size=(140, 30)) as p:
+            await p.pause()
+            await p.press("enter"); await p.pause(0.3)
+            assert fetched == ["t0"]
+            await p.press("down", "down", "down", "up"); await p.pause(0.3)
+            assert fetched == ["t0"] and [c for c in calls if c[0] == "read"] == [("read", "t0")]
+            await p.press("enter"); await p.pause(0.3)
+            assert fetched == ["t0", "t2"]                     # loads only on Enter
+
+    asyncio.run(run())

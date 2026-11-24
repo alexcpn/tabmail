@@ -74,12 +74,12 @@ uv run tabmail.py
 
 | Key | Action |
 |---|---|
-| `↑/↓` | move between emails (the side panel follows while it is open) |
+| `↑/↓` | move between emails (nothing is loaded until you press `Enter` or `s`) |
 | `←/→` or `h/l` | switch tabs |
 | `Enter` | show the email text in a side panel |
 | `PgDn/Space`, `PgUp` | scroll the side panel |
 | `o` | open the email in Gmail |
-| `Shift+↑/↓` | select several conversations (■); the side panel stays put |
+| `Shift+↑/↓` | select several conversations (■) |
 | `D` or `Delete` | move the selected conversations, or the current one, to Trash (needs `allow_changes = true`) |
 | `u` | undo the last move to Trash (the whole batch) |
 | `s` | AI summary of the current email, or one combined summary of a selection (up to 10) |

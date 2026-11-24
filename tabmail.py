@@ -1176,11 +1176,6 @@ class TabMail(App):
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         self.action_preview(self._thread_for(event))
 
-    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
-        # while the panel is open, follow the cursor so arrows browse mail by mail
-        if self.query_one("#preview-pane").has_class("open") and not self.selected:
-            self.action_preview(self._thread_for(event))
-
     def _switch(self, step: int) -> None:
         i = (self._active_index() + step) % len(self.tabs)
         self.query_one(TabbedContent).active = f"tab{i}"
