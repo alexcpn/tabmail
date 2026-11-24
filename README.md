@@ -1,5 +1,10 @@
 # tabmail
 
+[![CI](https://github.com/alexcpn/tabmail/actions/workflows/ci.yml/badge.svg)](https://github.com/alexcpn/tabmail/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/alexcpn/tabmail/actions/workflows/github-code-scanning/codeql/badge.svg)](https://github.com/alexcpn/tabmail/security/code-scanning)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/)
+
 Is your inbox out of control? Try tabmail: a dead-simple email viewer,
 sorted by common sense and a small AI.
 
