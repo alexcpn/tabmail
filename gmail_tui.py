@@ -31,6 +31,7 @@ import tomllib
 import webbrowser
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from functools import partial
 from datetime import datetime
 from html.parser import HTMLParser
 from pathlib import Path
@@ -39,8 +40,12 @@ from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, VerticalScroll
-from textual.widgets import DataTable, Footer, Header, Static, TabbedContent, TabPane
+from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.screen import ModalScreen
+from textual.widgets import (
+    DataTable, Footer, Header, Input, Label, OptionList, Static, TabbedContent, TabPane,
+)
+from textual.widgets.option_list import Option
 
 HERE = Path(__file__).resolve().parent
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "gmail-tui"
@@ -50,6 +55,8 @@ EXAMPLE_CONFIG = HERE / "config.example.toml"
 CLIENT_SECRET = CONFIG_DIR / "credentials.json"
 TOKEN_FILE = CONFIG_DIR / "token.json"
 AI_CACHE = CACHE_DIR / "ai_tabs.json"
+CORRECTIONS = CONFIG_DIR / "corrections.json"   # your manual moves + notes for the AI
+MAX_EXAMPLES = 40                               # most recent corrections shown to the AI
 SCOPE_READONLY = "https://www.googleapis.com/auth/gmail.readonly"
 SCOPE_MODIFY = "https://www.googleapis.com/auth/gmail.modify"  # read, label, trash; no permanent delete
 MAX_HTML_CHARS = 400_000
@@ -172,14 +179,26 @@ def fallback_classify(mail: Mail, cfg: Config) -> str:
 
 # ---------------------------------------------------------------- ai
 
-def ai_prompt(cfg: Config) -> str:
+def ai_prompt(cfg: Config, examples: list[dict] | tuple = ()) -> str:
     tabs = "\n".join(
         f"- {t.name}: {t.description or '(no description)'}" for t in cfg.tabs
+    )
+    names = {t.name for t in cfg.tabs}
+    shown = [e for e in examples if e.get("tab") in names][-MAX_EXAMPLES:]
+    learned = "\n".join(
+        f"- from {e['from']} | subject {e['subject']} -> {e['tab']}"
+        + (f"  (user's note: {e['note']})" if e.get("note") else "")
+        for e in shown
     )
     return (
         "You sort emails in a user's inbox into tabs.\n\n"
         f"Tabs:\n{tabs}\n\n"
         + (f"The user's own instructions:\n{cfg.instructions}\n\n" if cfg.instructions else "")
+        + (
+            "Emails the user moved by hand, with their notes. Sort similar mail "
+            f"(same sender, same kind of message) the same way:\n{learned}\n\n"
+            if learned else ""
+        )
         + "Each input line is `id | from | subject | hints`. hints may contain: "
         "bulk (mailing-list headers or a noreply-style sender), "
         "gmail:important, gmail:starred, gmail:promotions, gmail:updates, gmail:social, "
@@ -286,14 +305,14 @@ def pick_backend(cfg: Config) -> str | None:
 
 
 def ai_classify(
-    mails: list[Mail], cfg: Config, backend: str, runner=None, on_chunk=None
+    mails: list[Mail], cfg: Config, backend: str, runner=None, on_chunk=None, examples=()
 ) -> tuple[dict[str, str], list[str]]:
     """Sort mails with the AI: AI_CHUNK per request, AI_PARALLEL requests at once.
     Calls on_chunk(partial_result) as each request finishes, so the UI can
     update progressively. Returns (thread_id -> tab name, error messages);
     a failed request loses only its own chunk."""
     run = runner or {"claude-cli": _run_claude_cli, "anthropic-api": _run_anthropic_api}[backend]
-    system, schema = ai_prompt(cfg), ai_schema(cfg)
+    system, schema = ai_prompt(cfg, examples), ai_schema(cfg)
     names = {t.name for t in cfg.tabs}
     chunks = [mails[i : i + AI_CHUNK] for i in range(0, len(mails), AI_CHUNK)]
 
@@ -319,6 +338,35 @@ def ai_classify(
             if on_chunk:
                 on_chunk(got)
     return out, errors
+
+
+def load_corrections() -> dict:
+    try:
+        data = json.loads(CORRECTIONS.read_text())
+    except (OSError, ValueError):
+        data = {}
+    return {"overrides": data.get("overrides", {}), "examples": data.get("examples", [])}
+
+
+def save_corrections(data: dict) -> None:
+    data["examples"] = data["examples"][-200:]
+    CORRECTIONS.parent.mkdir(parents=True, exist_ok=True)
+    CORRECTIONS.write_text(json.dumps(data, indent=1))
+
+
+def add_tab_to_config(name: str, description: str) -> Path:
+    """Append a [[tab]] to the user's config (created from the example if
+    needed). Appending keeps the user's comments and layout intact."""
+    path = config_path()
+    if path == EXAMPLE_CONFIG:
+        path = USER_CONFIG
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(EXAMPLE_CONFIG.read_text())
+    text = path.read_text().rstrip("\n")
+    # json.dumps gives a valid TOML basic string for any text
+    text += f"\n\n[[tab]]\nname = {json.dumps(name)}\ndescription = {json.dumps(description)}\n"
+    path.write_text(text)
+    return path
 
 
 def config_hash(cfg: Config) -> str:
@@ -501,12 +549,31 @@ def fetch_body(svc, thread_id: str) -> tuple[str, str]:
     return header, text
 
 
-def trash_thread(svc, thread_id: str) -> None:
-    svc.users().threads().trash(userId="me", id=thread_id).execute()
+def _batch_threads(svc, method: str, thread_ids: list[str]) -> list[str]:
+    """Call threads().<method> for many threads in batched HTTP requests.
+    Returns the ids that failed."""
+    failed: list[str] = []
+    for i in range(0, len(thread_ids), 50):  # Gmail batches: keep well under the limit
+        part = thread_ids[i : i + 50]
+
+        def done(req_id, _resp, exc, part=part):
+            if exc is not None:
+                failed.append(part[int(req_id)])
+
+        batch = svc.new_batch_http_request(callback=done)
+        for n, tid in enumerate(part):
+            batch.add(getattr(svc.users().threads(), method)(userId="me", id=tid), request_id=str(n))
+        batch.execute()
+    return failed
 
 
-def untrash_thread(svc, thread_id: str) -> None:
-    svc.users().threads().untrash(userId="me", id=thread_id).execute()
+def trash_threads(svc, thread_ids: list[str]) -> list[str]:
+    """Move threads to Trash (recoverable for 30 days). Returns failed ids."""
+    return _batch_threads(svc, "trash", thread_ids)
+
+
+def untrash_threads(svc, thread_ids: list[str]) -> list[str]:
+    return _batch_threads(svc, "untrash", thread_ids)
 
 
 def mark_thread_read(svc, thread_id: str) -> None:
@@ -523,6 +590,86 @@ def fmt_when(d: datetime | None) -> str:
     return d.strftime("%H:%M") if d.date() == datetime.now().date() else d.strftime("%d %b")
 
 
+NEW_TAB = "__new_tab__"
+
+
+class MoveDialog(ModalScreen[dict | None]):
+    """c: pick a tab (or + New tab), then an optional note for the AI.
+    Dismisses with {"tab", "note", "new_description"} or None."""
+
+    DEFAULT_CSS = """
+    MoveDialog { align: center middle; }
+    MoveDialog > Vertical {
+        width: 64; height: auto; max-height: 80%;
+        border: thick $accent; background: $surface; padding: 1 2;
+    }
+    MoveDialog OptionList { height: auto; max-height: 16; }
+    MoveDialog Label { padding-bottom: 1; }
+    MoveDialog .hint { color: $text-muted; padding-top: 1; }
+    """
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    def __init__(self, title: str, tabs: list[str]) -> None:
+        super().__init__()
+        self.title_text, self.tabs = title, tabs
+        self.result: dict = {}
+        self.step = "tab"
+
+    def compose(self) -> ComposeResult:
+        with Vertical():
+            yield Label(self.title_text, id="prompt")
+            yield OptionList(
+                *[Option(t, id=t) for t in self.tabs], Option("+ New tab…", id=NEW_TAB),
+                id="choices",
+            )
+            yield Input(id="text")
+            yield Label("Enter to continue · Esc to cancel", classes="hint")
+
+    def on_mount(self) -> None:
+        self.query_one("#text").display = False
+        self.query_one("#choices").focus()
+
+    def _ask(self, step: str, prompt: str, placeholder: str) -> None:
+        self.step = step
+        self.query_one("#choices").display = False
+        self.query_one("#prompt", Label).update(prompt)
+        box = self.query_one("#text", Input)
+        box.value, box.placeholder, box.display = "", placeholder, True
+        box.focus()
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        if event.option.id == NEW_TAB:
+            self._ask("name", "Name of the new tab:", "e.g. Shopping")
+        else:
+            self.result["tab"] = event.option.id
+            self._ask("note", f"Moving to {event.option.id}. Note for the AI (optional):",
+                      "why it belongs there, e.g. 'daily updates from this cafe'")
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        value = event.value.strip()
+        if self.step == "name":
+            if not value or value in self.tabs or value == NEW_TAB:
+                self.notify("Pick a new, unused tab name.", severity="warning")
+                return
+            self.result["tab"] = value
+            self._ask("description", f"Describe what belongs in {value} (the AI reads this):",
+                      "e.g. Orders, deliveries and offers from shops")
+        elif self.step == "description":
+            if not value:
+                self.notify("A short description is needed so the AI can use the tab.",
+                            severity="warning")
+                return
+            self.result["new_description"] = value
+            self._ask("note", f"Moving to {self.result['tab']}. Note for the AI (optional):",
+                      "why it belongs there")
+        else:
+            self.result["note"] = value
+            self.dismiss(self.result)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class GmailTUI(App):
     TITLE = "Gmail"
     CSS = """
@@ -535,11 +682,14 @@ class GmailTUI(App):
     BINDINGS = [
         Binding("enter", "preview", "Read", show=True),
         Binding("o", "open", "Open in Gmail"),
-        Binding("escape", "close_preview", "Close", show=False),
+        Binding("escape", "escape", "Close", show=False),
+        Binding("shift+down", "extend_selection(1)", "Select", show=False, priority=True),
+        Binding("shift+up", "extend_selection(-1)", "Select", show=False, priority=True),
         Binding("pagedown,space", "scroll_preview(1)", "Scroll", show=False),
         Binding("pageup", "scroll_preview(-1)", "Scroll up", show=False),
         Binding("D,delete", "trash", "Trash"),
         Binding("u", "undo_trash", "Undo trash"),
+        Binding("c", "move", "Move / teach"),
         Binding("r", "refresh", "Refresh"),
         Binding("left,h", "prev_tab", "Prev tab", show=False, priority=True),
         Binding("right,l", "next_tab", "Next tab", show=False, priority=True),
@@ -559,7 +709,10 @@ class GmailTUI(App):
         self.mails: list[Mail] = []
         self.ai_tabs: dict[str, str] = load_ai_cache(self.cfg)
         self.ai_pending: set[str] = set()
-        self.trashed: list[Mail] = []        # undo stack for D
+        self.corrections = load_corrections()   # manual moves win over the AI
+        self.trashed: list[list[Mail]] = []  # undo stack for D, one entry per batch
+        self.selected: set[str] = set()      # thread ids picked with shift+arrows
+        self.anchor: int | None = None       # row where the shift-selection started
         self.shown_tid: str | None = None    # thread currently in the side panel
 
     def compose(self) -> ComposeResult:
@@ -569,7 +722,8 @@ class GmailTUI(App):
                 for i, t in enumerate(self.tabs):
                     with TabPane(t.name, id=f"tab{i}"):
                         table = DataTable(id=f"table{i}", cursor_type="row", zebra_stripes=True)
-                        table.add_columns(" ", "From", "Subject", "When")
+                        table.add_column("  ", key="mark")
+                        table.add_columns("From", "Subject", "When")
                         yield table
             with VerticalScroll(id="preview-pane"):
                 yield Static(id="preview-head")
@@ -581,6 +735,7 @@ class GmailTUI(App):
         self.action_refresh()
 
     def on_tabbed_content_tab_activated(self, _event: TabbedContent.TabActivated) -> None:
+        self.clear_selection()  # a selection belongs to one tab
         self.query_one(f"#table{self._active_index()}", DataTable).focus()
 
     def action_refresh(self) -> None:
@@ -604,9 +759,12 @@ class GmailTUI(App):
             self.call_from_thread(self.classify_with_ai)
 
     def tab_for(self, m: Mail) -> str:
-        """Pinned senders > AI verdict (cached per thread) > simple fallback."""
+        """Pinned senders > your manual moves > AI verdict > simple fallback."""
+        names = {t.name for t in self.tabs}
+        moved = self.corrections["overrides"].get(m.thread_id)
         return (
             pinned_tab(m, self.cfg, self.me)
+            or (moved if moved in names else None)
             or self.ai_tabs.get(m.thread_id)
             # still waiting for the AI: park it in the default tab rather than guess
             or (self.cfg.fallback_tab if m.thread_id in self.ai_pending else None)
@@ -617,7 +775,9 @@ class GmailTUI(App):
     def classify_with_ai(self) -> None:
         todo = [
             m for m in self.mails
-            if m.thread_id not in self.ai_tabs and not pinned_tab(m, self.cfg, self.me)
+            if m.thread_id not in self.ai_tabs
+            and m.thread_id not in self.corrections["overrides"]
+            and not pinned_tab(m, self.cfg, self.me)
         ]
         if not todo:
             return
@@ -633,7 +793,8 @@ class GmailTUI(App):
 
         self.call_from_thread(self.fill, self.mails, f"AI sorting 0/{len(todo)}…")
         try:
-            _, errors = ai_classify(todo, self.cfg, self.backend, on_chunk=progress)
+            _, errors = ai_classify(todo, self.cfg, self.backend, on_chunk=progress,
+                                    examples=self.corrections["examples"])
         except Exception as e:  # e.g. backend missing
             errors = [str(e)]
         self.ai_pending = set()
@@ -646,8 +807,13 @@ class GmailTUI(App):
             )
         self.call_from_thread(self.fill, self.mails)
 
+    def _mark(self, m: Mail) -> str:
+        return ("■" if m.thread_id in self.selected else " ") + ("●" if m.unread else " ")
+
     def fill(self, mails: list[Mail], status: str | None = None) -> None:
         self.mails = mails
+        live = {m.thread_id for m in mails}
+        self.selected &= live
         buckets: dict[str, list[Mail]] = {t.name: [] for t in self.tabs}
         for m in mails:
             buckets[self.tab_for(m)].append(m)
@@ -658,7 +824,7 @@ class GmailTUI(App):
             table.clear()
             for m in buckets[t.name]:
                 table.add_row(
-                    "●" if m.unread else "",
+                    self._mark(m),
                     m.sender_name[:28],
                     m.subject[:width],
                     fmt_when(m.when),
@@ -671,6 +837,8 @@ class GmailTUI(App):
             self.query_one(TabbedContent).get_tab(f"tab{i}").label = label
         ai = f"AI: {self.backend} ({self.cfg.model})" if self.backend else "AI off"
         self.sub_title = status or f"{len(mails)} threads · {datetime.now():%H:%M} · {ai}"
+        if self.selected:
+            self.sub_title = f"{len(self.selected)} selected · D to Trash · Esc clears"
 
     def _active_index(self) -> int:
         return int(self.query_one(TabbedContent).active.removeprefix("tab"))
@@ -755,29 +923,137 @@ class GmailTUI(App):
         mail.labels.discard("UNREAD")
         self.call_from_thread(self.fill, self.mails)
 
-    def action_trash(self) -> None:
-        tid = self._current_thread()
-        if not tid or not self._changes_allowed():
+    # ---- move / teach the AI (c)
+
+    def action_move(self) -> None:
+        ids = self.selected or ({self._current_thread()} - {None})
+        mails = [m for m in self.mails if m.thread_id in ids]
+        if not mails:
             return
-        mail = next((m for m in self.mails if m.thread_id == tid), None)
-        if mail:
-            self.trash(mail)
+        here = self.tabs[self._active_index()].name
+        what = f"“{mails[0].subject[:45]}”" if len(mails) == 1 else f"{len(mails)} conversations"
+        self.push_screen(
+            MoveDialog(f"Move {what} to:", [t.name for t in self.tabs if t.name != here]),
+            partial(self.apply_move, mails),
+        )
+
+    async def apply_move(self, mails: list[Mail], result: dict | None) -> None:
+        if not result:
+            return
+        tab, note = result["tab"], result.get("note", "")
+        if result.get("new_description"):
+            await self.create_tab(tab, result["new_description"])
+        for m in mails:
+            self.corrections["overrides"][m.thread_id] = tab
+            self.corrections["examples"].append({
+                "from": f"{m.sender_name} <{m.sender_addr}>", "subject": m.subject[:150],
+                "tab": tab, "note": note,
+            })
+        save_corrections(self.corrections)
+        # let the AI look again at other mail from the same senders, with this lesson
+        senders = {m.sender_addr.lower() for m in mails}
+        for m in self.mails:
+            if m.sender_addr.lower() in senders:
+                self.ai_tabs.pop(m.thread_id, None)
+        self.selected, self.anchor = set(), None
+        self.fill(self.mails)
+        self.notify(f"Moved {len(mails)} to {tab}" + (" · the AI will use your note" if note else ""))
+        if self.backend:
+            self.classify_with_ai()
+
+    async def create_tab(self, name: str, description: str) -> None:
+        path = add_tab_to_config(name, description)
+        self.cfg = load_config(path)
+        self.tabs = self.cfg.tabs
+        self.ai_tabs = {}  # the config changed: let the AI re-sort with the new tab
+        i = len(self.tabs) - 1
+        table = DataTable(id=f"table{i}", cursor_type="row", zebra_stripes=True)
+        table.add_column("  ", key="mark")
+        table.add_columns("From", "Subject", "When")
+        await self.query_one(TabbedContent).add_pane(TabPane(name, table, id=f"tab{i}"))
+        self.notify(f"Added tab {name} to {path}")
+
+    # ---- selection (shift+arrows)
+
+    def _table(self) -> DataTable:
+        return self.query_one(f"#table{self._active_index()}", DataTable)
+
+    def _refresh_marks(self, table: DataTable) -> None:
+        by_id = {m.thread_id: m for m in self.mails}
+        for r in range(table.row_count):
+            tid = table.coordinate_to_cell_key((r, 0)).row_key.value
+            if tid in by_id:
+                table.update_cell(tid, "mark", self._mark(by_id[tid]))
+        self.fill_status()
+
+    def fill_status(self) -> None:
+        if self.selected:
+            self.sub_title = f"{len(self.selected)} selected · D to Trash · Esc clears"
+        else:
+            ai = f"AI: {self.backend} ({self.cfg.model})" if self.backend else "AI off"
+            self.sub_title = f"{len(self.mails)} threads · {datetime.now():%H:%M} · {ai}"
+
+    def action_extend_selection(self, step: int) -> None:
+        table = self._table()
+        if table.row_count == 0:
+            return
+        if self.anchor is None or not self.selected:
+            self.anchor = table.cursor_row
+        row = max(0, min(table.row_count - 1, table.cursor_row + step))
+        table.move_cursor(row=row, animate=False)
+        lo, hi = sorted((self.anchor, row))
+        self.selected = {
+            table.coordinate_to_cell_key((r, 0)).row_key.value for r in range(lo, hi + 1)
+        }
+        self._refresh_marks(table)
+
+    def clear_selection(self) -> None:
+        if self.selected:
+            self.selected = set()
+            self.anchor = None
+            self._refresh_marks(self._table())
+
+    def action_escape(self) -> None:
+        if self.selected:
+            self.clear_selection()
+        else:
+            self.action_close_preview()
+
+    # ---- trash
+
+    def action_trash(self) -> None:
+        if not self._changes_allowed():
+            return
+        ids = self.selected or ({self._current_thread()} - {None})
+        mails = [m for m in self.mails if m.thread_id in ids]
+        if mails:
+            self.trash(mails)
 
     @work(thread=True, group="changes")
-    def trash(self, mail: Mail) -> None:
+    def trash(self, mails: list[Mail]) -> None:
         try:
-            trash_thread(self._body_service(), mail.thread_id)
+            failed = set(trash_threads(self._body_service(), [m.thread_id for m in mails]))
         except Exception as e:
             self.call_from_thread(self.notify, f"Could not move to Trash: {e}", severity="error")
             return
-        self.trashed.append(mail)
-        self.call_from_thread(self._after_trash, mail)
+        moved = [m for m in mails if m.thread_id not in failed]
+        if moved:
+            self.trashed.append(moved)
+        self.call_from_thread(self._after_trash, moved, len(failed))
 
-    def _after_trash(self, mail: Mail) -> None:
-        if self.shown_tid == mail.thread_id:
+    def _after_trash(self, moved: list[Mail], failed: int) -> None:
+        gone = {m.thread_id for m in moved}
+        if self.shown_tid in gone:
             self.action_close_preview()
-        self.fill([m for m in self.mails if m.thread_id != mail.thread_id])
-        self.notify(f"Moved to Trash: {mail.subject[:60]}  (u to undo)")
+        self.selected -= gone
+        self.anchor = None
+        self.fill([m for m in self.mails if m.thread_id not in gone])
+        if moved:
+            what = moved[0].subject[:60] if len(moved) == 1 else f"{len(moved)} conversations"
+            self.notify(f"Moved to Trash: {what}  (u to undo)")
+        if failed:
+            self.notify(f"{failed} could not be moved to Trash; they are still selected.",
+                        severity="warning")
 
     def action_undo_trash(self) -> None:
         if not self.trashed:
@@ -786,16 +1062,21 @@ class GmailTUI(App):
             self.untrash(self.trashed.pop())
 
     @work(thread=True, group="changes")
-    def untrash(self, mail: Mail) -> None:
+    def untrash(self, mails: list[Mail]) -> None:
         try:
-            untrash_thread(self._body_service(), mail.thread_id)
+            failed = set(untrash_threads(self._body_service(), [m.thread_id for m in mails]))
         except Exception as e:
-            self.trashed.append(mail)
+            self.trashed.append(mails)
             self.call_from_thread(self.notify, f"Could not undo: {e}", severity="error")
             return
-        restored = sorted(self.mails + [mail], key=lambda m: m.when or datetime.min, reverse=True)
+        back = [m for m in mails if m.thread_id not in failed]
+        restored = sorted(self.mails + back, key=lambda m: m.when or datetime.min, reverse=True)
         self.call_from_thread(self.fill, restored)
-        self.call_from_thread(self.notify, f"Restored: {mail.subject[:60]}")
+        what = back[0].subject[:60] if len(back) == 1 else f"{len(back)} conversations"
+        self.call_from_thread(self.notify, f"Restored: {what}")
+        if failed:
+            self.call_from_thread(self.notify, f"{len(failed)} could not be restored; "
+                                  "find them in Gmail's Trash.", severity="warning")
 
     def action_scroll_preview(self, direction: int) -> None:
         pane = self.query_one("#preview-pane", VerticalScroll)
@@ -810,7 +1091,7 @@ class GmailTUI(App):
 
     def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
         # while the panel is open, follow the cursor so arrows browse mail by mail
-        if self.query_one("#preview-pane").has_class("open"):
+        if self.query_one("#preview-pane").has_class("open") and not self.selected:
             self.action_preview(self._thread_for(event))
 
     def _switch(self, step: int) -> None:

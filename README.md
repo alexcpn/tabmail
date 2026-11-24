@@ -75,15 +75,31 @@ uv run gmail_tui.py
 | `←/→` or `h/l` | switch tabs |
 | `Enter` | show the email text in a side panel |
 | `PgDn/Space`, `PgUp` | scroll the side panel |
-| `Esc` | close the side panel |
 | `o` | open the email in Gmail |
-| `D` or `Delete` | move the conversation to Trash (needs `allow_changes = true`) |
-| `u` | undo the last move to Trash |
+| `Shift+↑/↓` | select several conversations (■); the side panel stays put |
+| `D` or `Delete` | move the selected conversations, or the current one, to Trash (needs `allow_changes = true`) |
+| `u` | undo the last move to Trash (the whole batch) |
+| `c` | move the current or selected conversations to another tab, or to a new one, with an optional note for the AI |
+| `Esc` | clear the selection, or close the side panel |
 | `r` | refresh |
 | `q` or `Ctrl+C` | quit |
 
 `●` means unread. With `allow_changes = true`, opening an email marks it read in Gmail. The header shows how many conversations were loaded and which
 AI backend is in use.
+
+## Teaching it
+
+When the AI gets one wrong, press `c` on it (or on a Shift-selection), pick the
+right tab, and optionally add a note such as "daily updates from this cafe are
+notifications". Then:
+
+- that conversation stays where you put it;
+- your most recent corrections (up to 40), with notes, are shown to the AI as examples
+  every time it sorts;
+- other mail from the same sender is re-sorted straight away with the new example.
+
+Choosing **+ New tab…** asks for a name and a one-line description, adds the tab
+to your `config.toml`, and re-sorts everything so the new tab can pick up mail.
 
 ## Files
 
@@ -92,6 +108,7 @@ AI backend is in use.
 | `~/.config/gmail-tui/config.toml` | your tabs and instructions |
 | `~/.config/gmail-tui/credentials.json` | your Google OAuth client (never commit it) |
 | `~/.config/gmail-tui/token.json` | your Gmail sign-in token |
+| `~/.config/gmail-tui/corrections.json` | your manual moves and notes for the AI |
 | `~/.cache/gmail-tui/ai_tabs.json` | cached AI sorting results |
 
 ## Tests

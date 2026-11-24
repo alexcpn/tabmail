@@ -173,11 +173,16 @@ def _ui_app(monkeypatch, tmp_path, allow_changes):
     monkeypatch.setattr(g, "AI_CACHE", tmp_path / "cache.json")
     calls = []
     monkeypatch.setattr(g, "fetch_body", lambda svc, tid: ("From: x", "body " + tid))
-    monkeypatch.setattr(g, "trash_thread", lambda svc, tid: calls.append(("trash", tid)))
-    monkeypatch.setattr(g, "untrash_thread", lambda svc, tid: calls.append(("untrash", tid)))
+    def batch(kind):
+        def f(svc, ids):
+            calls.extend((kind, i) for i in ids)
+            return []
+        return f
+    monkeypatch.setattr(g, "trash_threads", batch("trash"))
+    monkeypatch.setattr(g, "untrash_threads", batch("untrash"))
     monkeypatch.setattr(g, "mark_thread_read", lambda svc, tid: calls.append(("read", tid)))
     mails = [g.Mail(f"t{i}", f"P{i}", f"p{i}@gmail.com", f"S{i}", datetime(2026, 11, 20 - i),
-                    {"IMPORTANT", "UNREAD"}) for i in range(3)]
+                    {"IMPORTANT", "UNREAD"}) for i in range(5)]
 
     class T(g.GmailTUI):
         def action_refresh(self):
@@ -204,10 +209,10 @@ def test_trash_undo_and_mark_read(monkeypatch, tmp_path):
             assert not next(m for m in app.mails if m.thread_id == "t0").unread
             await p.press("down"); await p.pause(0.3)
             await p.press("D"); await p.pause(0.3)
-            assert ("trash", "t1") in calls and _rows(app) == ["t0", "t2"]
+            assert ("trash", "t1") in calls and _rows(app) == ["t0", "t2", "t3", "t4"]
             assert app.query_one("#table0", g.DataTable).cursor_row == 1   # place kept
             await p.press("u"); await p.pause(0.3)
-            assert ("untrash", "t1") in calls and _rows(app) == ["t0", "t1", "t2"]
+            assert ("untrash", "t1") in calls and _rows(app) == ["t0", "t1", "t2", "t3", "t4"]
 
     asyncio.run(run())
 
@@ -220,7 +225,7 @@ def test_read_only_mode_changes_nothing(monkeypatch, tmp_path):
             await p.pause()
             await p.press("enter"); await p.pause(0.3)
             await p.press("D"); await p.pause(0.3)
-            assert calls == [] and _rows(app) == ["t0", "t1", "t2"]
+            assert calls == [] and _rows(app) == ["t0", "t1", "t2", "t3", "t4"]
 
     asyncio.run(run())
 
@@ -235,3 +240,113 @@ def test_scope_choice(monkeypatch, tmp_path):
     assert g.gmail_creds(allow_changes=False).token == "x"
     with pytest.raises(SystemExit):          # needs a new sign-in -> no client secret here
         g.gmail_creds(allow_changes=True)
+
+
+def test_shift_select_and_bulk_trash(monkeypatch, tmp_path):
+    app, calls = _ui_app(monkeypatch, tmp_path, allow_changes=True)
+
+    async def run():
+        async with app.run_test(size=(140, 30)) as p:
+            await p.pause()
+            await p.press("enter"); await p.pause(0.3)          # panel open on t0
+            await p.press("down"); await p.pause(0.3)           # t1 (marked read)
+            calls.clear()
+            await p.press("shift+down", "shift+down"); await p.pause(0.3)
+            assert app.selected == {"t1", "t2", "t3"}
+            assert not any(c[0] == "read" for c in calls)       # selecting doesn't open/mark read
+            await p.press("shift+up"); await p.pause()
+            assert app.selected == {"t1", "t2"}                 # shrinks back toward the anchor
+            await p.press("escape"); await p.pause()
+            assert app.selected == set()                        # Esc clears selection first
+            await p.press("shift+down", "shift+down"); await p.pause()
+            assert app.selected == {"t2", "t3", "t4"}
+            await p.press("D"); await p.pause(0.3)
+            assert sorted(c[1] for c in calls if c[0] == "trash") == ["t2", "t3", "t4"]
+            assert _rows(app) == ["t0", "t1"] and app.selected == set()
+            await p.press("u"); await p.pause(0.3)               # undo restores the whole batch
+            assert _rows(app) == ["t0", "t1", "t2", "t3", "t4"]
+
+    asyncio.run(run())
+
+
+def test_batch_helper_reports_failures():
+    class Req:
+        def __init__(self, tid): self.tid = tid
+
+    class Batch:
+        def __init__(self, callback): self.cb, self.items = callback, []
+        def add(self, req, request_id): self.items.append((request_id, req))
+        def execute(self):
+            for rid, req in self.items:
+                self.cb(rid, {}, RuntimeError("x") if req.tid == "bad" else None)
+
+    class Svc:
+        batches = 0
+        def new_batch_http_request(self, callback):
+            Svc.batches += 1
+            return Batch(callback)
+        def users(self): return self
+        def threads(self): return self
+        def trash(self, userId, id): return Req(id)
+
+    ids = [f"t{i}" for i in range(120)] + ["bad"]
+    assert g.trash_threads(Svc(), ids) == ["bad"]
+    assert Svc.batches == 3                                     # 50 + 50 + 21
+
+
+def test_prompt_includes_corrections(cfg):
+    ex = [{"from": "Cafe <hi@cafe.com>", "subject": "Your daily update", "tab": "Notifications",
+           "note": "daily updates from this cafe"},
+          {"from": "x <x@y.com>", "subject": "s", "tab": "Deleted tab", "note": ""}]
+    p = g.ai_prompt(cfg, ex)
+    assert "hi@cafe.com" in p and "-> Notifications" in p and "daily updates from this cafe" in p
+    assert "Deleted tab" not in p                        # examples for removed tabs are skipped
+
+
+def test_add_tab_appends_valid_toml(tmp_path, monkeypatch):
+    c = tmp_path / "config.toml"
+    c.write_text(EXAMPLE.read_text())
+    monkeypatch.setenv("GMAIL_TUI_CONFIG", str(c))
+    g.add_tab_to_config('Shop "pings"', "Orders, deliveries & offers\nfrom shops")
+    cfg = g.load_config(c)
+    assert cfg.tabs[-1].name == 'Shop "pings"'
+    assert cfg.tabs[-1].description == "Orders, deliveries & offers\nfrom shops"
+    assert "# gmail-tui configuration" in c.read_text()   # comments kept
+
+
+def test_move_dialog_teaches_ai_and_new_tab(monkeypatch, tmp_path):
+    app, calls = _ui_app(monkeypatch, tmp_path, allow_changes=False)
+    monkeypatch.setattr(g, "CORRECTIONS", tmp_path / "corrections.json")
+    app.corrections = g.load_corrections()
+
+    def tab_of(tid):
+        return app.tab_for(next(m for m in app.mails if m.thread_id == tid))
+
+    async def run():
+        async with app.run_test(size=(140, 34)) as p:
+            await p.pause()
+            # move t0 to Jobs with a note
+            await p.press("c"); await p.pause()
+            dlg = app.screen
+            assert isinstance(dlg, g.MoveDialog) and "Important" not in dlg.tabs
+            ol = dlg.query_one(g.OptionList)
+            ol.highlighted = dlg.tabs.index("Jobs"); await p.press("enter"); await p.pause()
+            await p.press(*"recruiter"); await p.press("enter"); await p.pause(0.3)
+            assert tab_of("t0") == "Jobs"
+            saved = g.load_corrections()
+            assert saved["overrides"]["t0"] == "Jobs" and saved["examples"][-1]["note"] == "recruiter"
+            # select two and send them to a brand-new tab
+            await p.press("shift+down"); await p.pause()
+            await p.press("c"); await p.pause()
+            dlg = app.screen
+            ol = dlg.query_one(g.OptionList)
+            ol.highlighted = ol.option_count - 1; await p.press("enter"); await p.pause()
+            await p.press(*"Shop"); await p.press("enter"); await p.pause()
+            await p.press(*"orders"); await p.press("enter"); await p.pause()
+            await p.press("enter"); await p.pause(0.5)       # no note
+            assert app.tabs[-1].name == "Shop"
+            assert tab_of("t1") == "Shop" and tab_of("t2") == "Shop"
+            tc = app.query_one(g.TabbedContent)
+            assert str(tc.get_tab(f"tab{len(app.tabs) - 1}").label).startswith("Shop (2")
+
+    asyncio.run(run())
