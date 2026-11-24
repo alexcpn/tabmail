@@ -2,10 +2,30 @@
 
 A Gmail inbox for the terminal, sorted into tabs by an AI.
 
-You describe your tabs in plain English ("Important: written to me by a real
-person, or needs me to act"). A small, fast model (Claude Haiku by default)
-reads each email's **sender and subject** and puts it in the tab that fits.
-There are no hard-coded sender lists or filters to maintain.
+## Why
+
+A real inbox is mostly noise: bank alerts, order updates, job alerts,
+newsletters, promotions. The few emails a person actually wrote to you get
+buried among them. Gmail's own help doesn't fix this:
+
+- **Its "Important" marker is too generous.** It flags a cafe's daily update
+  as readily as a message from a friend.
+- **Its category tabs are fixed.** You can't say what *you* mean by
+  Notifications or Jobs.
+- **Filters are endless upkeep.** Every new sender needs another rule, and the
+  rules quietly go stale.
+
+tabmail takes a different approach: you describe each tab in a sentence of
+plain English, and a small, fast AI model reads each email's sender and
+subject and decides. When it gets one wrong, press `c`, move the email and add
+a note, and it learns from that. You keep tuning a few sentences, not
+hundreds of filter rules.
+
+## What it is
+
+A keyboard-driven terminal app. A tab is just a name and a description, such
+as "Important: written to me by a real person, or needs me to act". Claude
+Haiku (by default) sorts every email into one of those tabs.
 
 ```
  Important (4, 2●) │ Notifications (31) │ Jobs (12) │ News (40) │ Other (3)
