@@ -1,0 +1,50 @@
+# gmail-tui configuration
+#
+# Copy this file to ~/.config/gmail-tui/config.toml and edit it.
+# Everything about how mail is sorted is plain English: an AI model reads each
+# email's sender and subject (never the body) and picks the tab whose
+# description fits best. Change a description and mail is re-sorted on the
+# next refresh.
+
+# Free-form notes about you and your mail. The AI reads these with every batch.
+instructions = """
+Put mail written personally to me by a real person in Important,
+and anything that needs me to act: bills due, security alerts,
+interviews, deliveries that need me to be home.
+Automated mail that only looks personal is not Important.
+"""
+
+[settings]
+query = "in:inbox newer_than:7d"   # any Gmail search
+max_messages = 300
+ai = "auto"            # auto | claude-cli | anthropic-api | off
+                       #   claude-cli:    the `claude` CLI (uses whatever it is logged in with)
+                       #   anthropic-api: ANTHROPIC_API_KEY
+                       #   auto:          claude-cli if installed, else the API if a key is set
+model = "haiku"        # fast and cheap; "sonnet" or a full model id also work
+default_tab = "Other"  # where mail goes when the AI is off or unavailable
+
+
+# Tabs, shown left to right. `description` tells the AI what belongs there.
+# Optional `senders` pins mail from addresses containing any of these strings
+# to the tab, overriding the AI ("me" = mail you sent to yourself).
+
+[[tab]]
+name = "Important"
+description = "Written personally to me by a real person, or needs me to act or reply."
+
+[[tab]]
+name = "Notifications"
+description = "Routine automated updates: orders, deliveries, bank and card alerts, statements, account and login alerts, daily or weekly digests from apps and services."
+
+[[tab]]
+name = "Jobs"
+description = "Job alerts, recruiter messages, application updates."
+
+[[tab]]
+name = "News"
+description = "Newsletters, articles, news digests, marketing, promotions, offers, webinars."
+
+[[tab]]
+name = "Other"
+description = "Anything that fits none of the other tabs."
