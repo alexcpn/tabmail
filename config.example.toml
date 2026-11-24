@@ -26,6 +26,8 @@ default_tab = "Other"  # where mail goes when the AI is off or unavailable
 allow_changes = false   # true: opening an email marks it read in Gmail, D moves it to
                        # Trash (u undoes). Asks Google for gmail.modify instead of
                        # read-only access, so you sign in again once. Never deletes permanently.
+summaries = true       # s summarizes the current email (or a selection). This sends the
+                       # email's text to the AI, only when you press s. false turns it off.
 
 
 # Tabs, shown left to right. `description` tells the AI what belongs there.

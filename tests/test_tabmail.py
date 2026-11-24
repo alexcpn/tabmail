@@ -350,3 +350,61 @@ def test_move_dialog_teaches_ai_and_new_tab(monkeypatch, tmp_path):
             assert str(tc.get_tab(f"tab{len(app.tabs) - 1}").label).startswith("Shop (2")
 
     asyncio.run(run())
+
+
+def test_summary_prompt_and_input_limits(monkeypatch):
+    assert "Action:" in g.summary_prompt(1) and "untrusted" in g.summary_prompt(1)
+    assert "these 3 emails" in g.summary_prompt(3)
+    one = g.summary_input([("From: a", "x" * (g.SUMMARY_CHARS_ONE + 50))])
+    assert one.endswith("[…truncated]") and one.count("x") == g.SUMMARY_CHARS_ONE
+    many = g.summary_input([("h", "y" * 5000), ("h", "short")])
+    assert many.count("y") == g.SUMMARY_CHARS_EACH and "=== Email 2 ===" in many
+
+
+def test_summarize_key(monkeypatch, tmp_path):
+    app, calls = _ui_app(monkeypatch, tmp_path, allow_changes=True)
+    seen = []
+
+    def fake_runner(system, schema, text, model):
+        seen.append(text)
+        return {"summary": "Action: reply by Friday\n- point " + str(text.count("=== Email"))}
+
+    monkeypatch.setattr(g, "_run_claude_cli", fake_runner)
+
+    class T(type(app)):
+        def action_refresh(self):
+            super().action_refresh()
+            self.backend = "claude-cli"
+
+    app = T()
+    body = lambda: str(app.query_one("#preview-body", g.Static).render())
+
+    async def run():
+        async with app.run_test(size=(140, 30)) as p:
+            await p.pause()
+            await p.press("s"); await p.pause(0.3)
+            assert body() == "Action: reply by Friday\n- point 1"
+            assert "body t0" in seen[0]
+            assert not any(c[0] == "read" for c in calls)        # summarizing doesn't mark read
+            await p.press("s"); await p.pause(0.3)
+            assert len(seen) == 1                                # second press: remembered
+            await p.press("shift+down", "shift+down"); await p.pause()
+            await p.press("s"); await p.pause(0.3)
+            assert body().endswith("point 3") and len(seen) == 2  # one call for the selection
+
+    asyncio.run(run())
+
+
+def test_summaries_can_be_turned_off(monkeypatch, tmp_path):
+    app, _ = _ui_app(monkeypatch, tmp_path, allow_changes=False)
+    app.cfg.summaries = False
+    monkeypatch.setattr(g, "ai_summarize", lambda *a, **k: pytest.fail("AI called"))
+
+    async def run():
+        async with app.run_test(size=(140, 30)) as p:
+            await p.pause()
+            app.backend = "claude-cli"
+            await p.press("s"); await p.pause(0.3)
+            assert not app.query_one("#preview-pane").has_class("open")
+
+    asyncio.run(run())

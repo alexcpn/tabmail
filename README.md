@@ -19,8 +19,11 @@ There are no hard-coded sender lists or filters to maintain.
   send, delete or change anything. Set `allow_changes = true` to have opening
   an email mark it read, and `D` move it to Trash (`u` undoes it). That asks
   Google for `gmail.modify` instead. Mail is never deleted permanently or sent.
-- **Only sender and subject go to the AI**, never email bodies. Email text is
-  passed as data, and the `claude` CLI runs with no tools.
+- **For sorting, only sender and subject go to the AI**, never email bodies.
+  Email text is passed as data, and the `claude` CLI runs with no tools.
+- **Summaries on demand.** Press `s` for a short AI summary of the email you're
+  on (or of a selection), with any action and deadline first. Only then is that
+  email's text sent to the AI; set `summaries = false` to turn this off.
 - **Each email is sorted once.** Results are cached per conversation, so a
   refresh only sends new mail. Edit your config and everything is re-sorted.
 
@@ -79,6 +82,7 @@ uv run tabmail.py
 | `Shift+↑/↓` | select several conversations (■); the side panel stays put |
 | `D` or `Delete` | move the selected conversations, or the current one, to Trash (needs `allow_changes = true`) |
 | `u` | undo the last move to Trash (the whole batch) |
+| `s` | AI summary of the current email, or one combined summary of a selection (up to 10) |
 | `c` | move the current or selected conversations to another tab, or to a new one, with an optional note for the AI |
 | `Esc` | clear the selection, or close the side panel |
 | `r` | refresh |
