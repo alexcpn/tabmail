@@ -40,7 +40,7 @@ Haiku (by default) sorts every email into one of those tabs.
 
 ![tabmail: an inbox sorted into Important, Notifications, Jobs and News tabs, with an AI summary of a bill in the side panel](docs/screenshot.svg)
 
-*Demo data. Above: switching tabs with the arrow keys. Here: the side panel shows the summary you get by pressing `s`.*
+*Demo data. Top: switching tabs with the arrow keys. Bottom: the summary you get by pressing `s`.*
 
 - **Changes nothing unless you ask.** By default tabmail only reads. Set
   `allow_changes = true` to have opening an email mark it read, and `D` move
