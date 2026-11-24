@@ -29,6 +29,7 @@ import subprocess
 import sys
 import tomllib
 import webbrowser
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 from html.parser import HTMLParser
@@ -53,7 +54,8 @@ SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
 MAX_HTML_CHARS = 400_000
 MAX_BODY_CHARS = 30_000
 BODY_TIMEOUT = 20  # seconds before the side panel gives up
-AI_CHUNK = 80      # emails per AI request
+AI_CHUNK = 40      # emails per AI request
+AI_PARALLEL = 4    # AI requests in flight at once
 
 
 # ---------------------------------------------------------------- data
@@ -280,20 +282,40 @@ def pick_backend(cfg: Config) -> str | None:
     return None
 
 
-def ai_classify(mails: list[Mail], cfg: Config, backend: str, runner=None) -> dict[str, str]:
-    """Sort mails with the AI, AI_CHUNK at a time. Returns thread_id -> tab name."""
+def ai_classify(
+    mails: list[Mail], cfg: Config, backend: str, runner=None, on_chunk=None
+) -> tuple[dict[str, str], list[str]]:
+    """Sort mails with the AI: AI_CHUNK per request, AI_PARALLEL requests at once.
+    Calls on_chunk(partial_result) as each request finishes, so the UI can
+    update progressively. Returns (thread_id -> tab name, error messages);
+    a failed request loses only its own chunk."""
     run = runner or {"claude-cli": _run_claude_cli, "anthropic-api": _run_anthropic_api}[backend]
     system, schema = ai_prompt(cfg), ai_schema(cfg)
     names = {t.name for t in cfg.tabs}
-    out: dict[str, str] = {}
-    for i in range(0, len(mails), AI_CHUNK):
-        chunk = mails[i : i + AI_CHUNK]
+    chunks = [mails[i : i + AI_CHUNK] for i in range(0, len(mails), AI_CHUNK)]
+
+    def one(chunk: list[Mail]) -> dict[str, str]:
         result = run(system, schema, ai_lines(chunk), cfg.model)
+        got = {}
         for item in result.get("labels", []):
             idx = int(item["id"]) if str(item.get("id", "")).isdigit() else -1
             if 0 <= idx < len(chunk) and item.get("tab") in names:
-                out[chunk[idx].thread_id] = item["tab"]
-    return out
+                got[chunk[idx].thread_id] = item["tab"]
+        return got
+
+    out: dict[str, str] = {}
+    errors: list[str] = []
+    with ThreadPoolExecutor(max_workers=AI_PARALLEL) as pool:
+        for fut in as_completed([pool.submit(one, c) for c in chunks]):
+            try:
+                got = fut.result()
+            except Exception as e:
+                errors.append(str(e))
+                continue
+            out.update(got)
+            if on_chunk:
+                on_chunk(got)
+    return out, errors
 
 
 def config_hash(cfg: Config) -> str:
@@ -510,6 +532,7 @@ class GmailTUI(App):
         self.me = ""
         self.mails: list[Mail] = []
         self.ai_tabs: dict[str, str] = load_ai_cache(self.cfg)
+        self.ai_pending: set[str] = set()
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -557,6 +580,8 @@ class GmailTUI(App):
         return (
             pinned_tab(m, self.cfg, self.me)
             or self.ai_tabs.get(m.thread_id)
+            # still waiting for the AI: park it in the default tab rather than guess
+            or (self.cfg.fallback_tab if m.thread_id in self.ai_pending else None)
             or fallback_classify(m, self.cfg)
         )
 
@@ -568,17 +593,32 @@ class GmailTUI(App):
         ]
         if not todo:
             return
-        self.call_from_thread(setattr, self, "sub_title", f"AI sorting {len(todo)}…")
+        self.ai_pending = {m.thread_id for m in todo}
+        done = 0
+
+        def progress(got: dict[str, str]) -> None:
+            nonlocal done
+            done += len(got)
+            self.ai_tabs.update(got)
+            self.ai_pending -= set(got)
+            self.call_from_thread(self.fill, self.mails, f"AI sorting {done}/{len(todo)}…")
+
+        self.call_from_thread(self.fill, self.mails, f"AI sorting 0/{len(todo)}…")
         try:
-            got = ai_classify(todo, self.cfg, self.backend)
-        except Exception as e:
-            self.call_from_thread(self.notify, f"AI sort skipped: {e}", severity="warning")
-            got = {}
-        self.ai_tabs.update(got)
+            _, errors = ai_classify(todo, self.cfg, self.backend, on_chunk=progress)
+        except Exception as e:  # e.g. backend missing
+            errors = [str(e)]
+        self.ai_pending = set()
         save_ai_cache(self.cfg, self.ai_tabs)
+        if errors:
+            self.call_from_thread(
+                self.notify,
+                f"AI could not sort some mail ({errors[0][:150]}); press r to retry",
+                severity="warning", timeout=10,
+            )
         self.call_from_thread(self.fill, self.mails)
 
-    def fill(self, mails: list[Mail]) -> None:
+    def fill(self, mails: list[Mail], status: str | None = None) -> None:
         self.mails = mails
         buckets: dict[str, list[Mail]] = {t.name: [] for t in self.tabs}
         for m in mails:
@@ -599,7 +639,7 @@ class GmailTUI(App):
             label = f"{t.name} ({len(buckets[t.name])}" + (f", {unread}●)" if unread else ")")
             self.query_one(TabbedContent).get_tab(f"tab{i}").label = label
         ai = f"AI: {self.backend} ({self.cfg.model})" if self.backend else "AI off"
-        self.sub_title = f"{len(mails)} threads · {datetime.now():%H:%M} · {ai}"
+        self.sub_title = status or f"{len(mails)} threads · {datetime.now():%H:%M} · {ai}"
 
     def _active_index(self) -> int:
         return int(self.query_one(TabbedContent).active.removeprefix("tab"))

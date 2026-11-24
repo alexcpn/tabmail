@@ -80,9 +80,25 @@ def test_ai_classify_maps_ids_and_drops_bad_answers(cfg, monkeypatch):
         labels.append({"id": "99", "tab": "Jobs"})       # ignored
         return {"labels": labels}
 
-    got = g.ai_classify(mails, cfg, "claude-cli", runner=runner)
+    seen = []
+    got, errors = g.ai_classify(mails, cfg, "claude-cli", runner=runner, on_chunk=seen.append)
     assert len(calls) == 3                               # chunked 2 + 2 + 1
-    assert got == {f"t{i}": "News" for i in range(5)}
+    assert got == {f"t{i}": "News" for i in range(5)} and errors == []
+    assert len(seen) == 3                                # progress per chunk
+
+
+def test_ai_classify_keeps_good_chunks_when_one_fails(cfg, monkeypatch):
+    monkeypatch.setattr(g, "AI_CHUNK", 2)
+    mails = [mail(f"t{i}", f"p{i}@x.com") for i in range(4)]
+
+    def runner(system, schema, lines, model):
+        if "p0@" in lines:
+            raise RuntimeError("boom")
+        return {"labels": [{"id": str(i), "tab": "Jobs"} for i in range(len(lines.splitlines()))]}
+
+    got, errors = g.ai_classify(mails, cfg, "claude-cli", runner=runner)
+    assert got == {"t2": "Jobs", "t3": "Jobs"}
+    assert errors == ["boom"]
 
 
 def test_ai_cache_resets_when_config_changes(cfg, tmp_path, monkeypatch):
