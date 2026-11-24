@@ -7,13 +7,13 @@
 #   "anthropic>=0.70",
 # ]
 # ///
-"""gmail-tui: a read-only, tabbed Gmail inbox for the terminal.
+"""tabmail: a read-only, tabbed Gmail inbox for the terminal.
 
 Tabs are described in plain English in a config file; an AI model (Claude
 Haiku by default) reads each email's sender and subject and puts it in the
 tab whose description fits. Enter shows the email text, `o` opens it in Gmail.
 
-Run:  uv run gmail_tui.py
+Run:  uv run tabmail.py
 """
 
 from __future__ import annotations
@@ -48,8 +48,8 @@ from textual.widgets import (
 from textual.widgets.option_list import Option
 
 HERE = Path(__file__).resolve().parent
-CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "gmail-tui"
-CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "gmail-tui"
+CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "tabmail"
+CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "tabmail"
 USER_CONFIG = CONFIG_DIR / "config.toml"
 EXAMPLE_CONFIG = HERE / "config.example.toml"
 CLIENT_SECRET = CONFIG_DIR / "credentials.json"
@@ -109,7 +109,7 @@ class Config:
 
 
 def config_path() -> Path:
-    env = os.environ.get("GMAIL_TUI_CONFIG")
+    env = os.environ.get("TABMAIL_CONFIG")
     if env:
         return Path(env).expanduser()
     return USER_CONFIG if USER_CONFIG.exists() else EXAMPLE_CONFIG
@@ -670,7 +670,7 @@ class MoveDialog(ModalScreen[dict | None]):
         self.dismiss(None)
 
 
-class GmailTUI(App):
+class TabMail(App):
     TITLE = "Gmail"
     CSS = """
     DataTable { height: 1fr; }
@@ -1111,7 +1111,7 @@ def main() -> None:
     # for broader access) opens a browser and prints a link.
     creds = gmail_creds(load_config().allow_changes)
     try:
-        GmailTUI(creds).run()  # restores the terminal when it returns
+        TabMail(creds).run()  # restores the terminal when it returns
     finally:
         for proc in list(CHILDREN):
             proc.kill()

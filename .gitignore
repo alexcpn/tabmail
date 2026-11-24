@@ -1,4 +1,4 @@
-# secrets and personal config live in ~/.config/gmail-tui/, never here
+# secrets and personal config live in ~/.config/tabmail/, never here
 credentials.json
 client_secret*.json
 token.json

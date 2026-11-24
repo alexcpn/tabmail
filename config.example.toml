@@ -1,6 +1,6 @@
-# gmail-tui configuration
+# tabmail configuration
 #
-# Copy this file to ~/.config/gmail-tui/config.toml and edit it.
+# Copy this file to ~/.config/tabmail/config.toml and edit it.
 # Everything about how mail is sorted is plain English: an AI model reads each
 # email's sender and subject (never the body) and picks the tab whose
 # description fits best. Change a description and mail is re-sorted on the

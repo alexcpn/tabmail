@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import gmail_tui as g  # noqa: E402
+import tabmail as g  # noqa: E402
 
 EXAMPLE = Path(__file__).resolve().parents[1] / "config.example.toml"
 
@@ -169,7 +169,7 @@ def _ui_app(monkeypatch, tmp_path, allow_changes):
     cfg_file = tmp_path / "c.toml"
     cfg_file.write_text(EXAMPLE.read_text().replace(
         "allow_changes = false", f"allow_changes = {str(allow_changes).lower()}"))
-    monkeypatch.setenv("GMAIL_TUI_CONFIG", str(cfg_file))
+    monkeypatch.setenv("TABMAIL_CONFIG", str(cfg_file))
     monkeypatch.setattr(g, "AI_CACHE", tmp_path / "cache.json")
     calls = []
     monkeypatch.setattr(g, "fetch_body", lambda svc, tid: ("From: x", "body " + tid))
@@ -184,7 +184,7 @@ def _ui_app(monkeypatch, tmp_path, allow_changes):
     mails = [g.Mail(f"t{i}", f"P{i}", f"p{i}@gmail.com", f"S{i}", datetime(2026, 11, 20 - i),
                     {"IMPORTANT", "UNREAD"}) for i in range(5)]
 
-    class T(g.GmailTUI):
+    class T(g.TabMail):
         def action_refresh(self):
             self.svc = object()
             self.backend = None
@@ -306,12 +306,12 @@ def test_prompt_includes_corrections(cfg):
 def test_add_tab_appends_valid_toml(tmp_path, monkeypatch):
     c = tmp_path / "config.toml"
     c.write_text(EXAMPLE.read_text())
-    monkeypatch.setenv("GMAIL_TUI_CONFIG", str(c))
+    monkeypatch.setenv("TABMAIL_CONFIG", str(c))
     g.add_tab_to_config('Shop "pings"', "Orders, deliveries & offers\nfrom shops")
     cfg = g.load_config(c)
     assert cfg.tabs[-1].name == 'Shop "pings"'
     assert cfg.tabs[-1].description == "Orders, deliveries & offers\nfrom shops"
-    assert "# gmail-tui configuration" in c.read_text()   # comments kept
+    assert "# tabmail configuration" in c.read_text()   # comments kept
 
 
 def test_move_dialog_teaches_ai_and_new_tab(monkeypatch, tmp_path):

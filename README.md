@@ -1,6 +1,6 @@
-# gmail-tui
+# tabmail
 
-A read-only Gmail inbox for the terminal, sorted into tabs by an AI.
+A Gmail inbox for the terminal, sorted into tabs by an AI.
 
 You describe your tabs in plain English ("Important: written to me by a real
 person, or needs me to act"). A small, fast model (Claude Haiku by default)
@@ -35,10 +35,10 @@ There are no hard-coded sender lists or filters to maintain.
    `.../auth/gmail.modify` if you'll use `allow_changes`).
 4. **APIs & Services → Credentials → Create credentials → OAuth client ID**:
    choose **Desktop app** and download the JSON file.
-5. Save it as `~/.config/gmail-tui/credentials.json`.
+5. Save it as `~/.config/tabmail/credentials.json`.
 
 On the first run a browser window opens so you can sign in. The token is saved
-to `~/.config/gmail-tui/token.json` (mode 600).
+to `~/.config/tabmail/token.json` (mode 600).
 
 ### 2. An AI backend (pick one)
 
@@ -52,19 +52,19 @@ to `~/.config/gmail-tui/token.json` (mode 600).
 ### 3. Your config
 
 ```sh
-mkdir -p ~/.config/gmail-tui
-cp config.example.toml ~/.config/gmail-tui/config.toml
+mkdir -p ~/.config/tabmail
+cp config.example.toml ~/.config/tabmail/config.toml
 ```
 
 Edit the tab names, the `description` of each tab, and the free-form
 `instructions`. That text is all the AI goes on. Optional `senders` pins mail
 from given addresses to a tab, overriding the AI; `"me"` matches mail you send
-to yourself. Set `GMAIL_TUI_CONFIG` to use a config file somewhere else.
+to yourself. Set `TABMAIL_CONFIG` to use a config file somewhere else.
 
 ## Run
 
 ```sh
-uv run gmail_tui.py
+uv run tabmail.py
 ```
 
 [uv](https://docs.astral.sh/uv/) installs the dependencies on the first run.
@@ -105,11 +105,11 @@ to your `config.toml`, and re-sorts everything so the new tab can pick up mail.
 
 | Path | What |
 |---|---|
-| `~/.config/gmail-tui/config.toml` | your tabs and instructions |
-| `~/.config/gmail-tui/credentials.json` | your Google OAuth client (never commit it) |
-| `~/.config/gmail-tui/token.json` | your Gmail sign-in token |
-| `~/.config/gmail-tui/corrections.json` | your manual moves and notes for the AI |
-| `~/.cache/gmail-tui/ai_tabs.json` | cached AI sorting results |
+| `~/.config/tabmail/config.toml` | your tabs and instructions |
+| `~/.config/tabmail/credentials.json` | your Google OAuth client (never commit it) |
+| `~/.config/tabmail/token.json` | your Gmail sign-in token |
+| `~/.config/tabmail/corrections.json` | your manual moves and notes for the AI |
+| `~/.cache/tabmail/ai_tabs.json` | cached AI sorting results |
 
 ## Tests
 
