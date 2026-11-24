@@ -155,6 +155,13 @@ uv run tabmail.py
 
 [uv](https://docs.astral.sh/uv/) installs the dependencies on the first run.
 
+| Command | What it does |
+|---|---|
+| `uv run tabmail.py` | start tabmail |
+| `uv run tabmail.py --setup-imap` | sign in with a Gmail app password, replacing any saved one |
+| `uv run tabmail.py --forget-imap` | remove the saved app password from your keyring |
+| `uv run tabmail.py --help` | list these options |
+
 ### Start it from your app launcher
 
 ```sh
