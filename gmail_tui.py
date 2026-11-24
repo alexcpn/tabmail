@@ -50,7 +50,8 @@ EXAMPLE_CONFIG = HERE / "config.example.toml"
 CLIENT_SECRET = CONFIG_DIR / "credentials.json"
 TOKEN_FILE = CONFIG_DIR / "token.json"
 AI_CACHE = CACHE_DIR / "ai_tabs.json"
-SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
+SCOPE_READONLY = "https://www.googleapis.com/auth/gmail.readonly"
+SCOPE_MODIFY = "https://www.googleapis.com/auth/gmail.modify"  # read, label, trash; no permanent delete
 MAX_HTML_CHARS = 400_000
 MAX_BODY_CHARS = 30_000
 BODY_TIMEOUT = 20  # seconds before the side panel gives up
@@ -91,6 +92,7 @@ class Config:
     ai: str = "auto"         # auto | claude-cli | anthropic-api | off
     model: str = "haiku"     # claude-cli alias, or full model id for the API
     default_tab: str = ""    # where mail goes when the AI is off or fails
+    allow_changes: bool = False  # mark read on open, D moves to Trash
     source: str = ""         # the raw config text (AI cache is keyed on it)
 
     @property
@@ -129,6 +131,7 @@ def load_config(path: Path | None = None) -> Config:
         ai=s.get("ai", Config.ai),
         model=s.get("model", Config.model),
         default_tab=s.get("default_tab", ""),
+        allow_changes=bool(s.get("allow_changes", False)),
         source=text,
     )
 
@@ -339,14 +342,21 @@ def save_ai_cache(cfg: Config, tabs: dict[str, str]) -> None:
 
 # ---------------------------------------------------------------- gmail
 
-def gmail_creds():
+def gmail_creds(allow_changes: bool = False):
+    """Load or create the Gmail token. With allow_changes the app asks for
+    gmail.modify (mark read, move to Trash); otherwise gmail.readonly.
+    A saved token that lacks the needed scope triggers a new sign-in."""
     from google.auth.transport.requests import Request
     from google.oauth2.credentials import Credentials
     from google_auth_oauthlib.flow import InstalledAppFlow
 
+    scopes = [SCOPE_MODIFY if allow_changes else SCOPE_READONLY]
     creds = None
     if TOKEN_FILE.exists():
-        creds = Credentials.from_authorized_user_file(str(TOKEN_FILE), SCOPES)
+        creds = Credentials.from_authorized_user_file(str(TOKEN_FILE))
+        granted = set(creds.scopes or [])
+        if not (set(scopes) <= granted or (scopes == [SCOPE_READONLY] and SCOPE_MODIFY in granted)):
+            creds = None  # need a broader scope: sign in again
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
@@ -355,7 +365,7 @@ def gmail_creds():
                 raise SystemExit(
                     f"Missing {CLIENT_SECRET}. See README.md for the one-time setup."
                 )
-            flow = InstalledAppFlow.from_client_secrets_file(str(CLIENT_SECRET), SCOPES)
+            flow = InstalledAppFlow.from_client_secrets_file(str(CLIENT_SECRET), scopes)
             creds = flow.run_local_server(port=0)
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         TOKEN_FILE.write_text(creds.to_json())
@@ -491,6 +501,20 @@ def fetch_body(svc, thread_id: str) -> tuple[str, str]:
     return header, text
 
 
+def trash_thread(svc, thread_id: str) -> None:
+    svc.users().threads().trash(userId="me", id=thread_id).execute()
+
+
+def untrash_thread(svc, thread_id: str) -> None:
+    svc.users().threads().untrash(userId="me", id=thread_id).execute()
+
+
+def mark_thread_read(svc, thread_id: str) -> None:
+    svc.users().threads().modify(
+        userId="me", id=thread_id, body={"removeLabelIds": ["UNREAD"]}
+    ).execute()
+
+
 # ---------------------------------------------------------------- ui
 
 def fmt_when(d: datetime | None) -> str:
@@ -514,6 +538,8 @@ class GmailTUI(App):
         Binding("escape", "close_preview", "Close", show=False),
         Binding("pagedown,space", "scroll_preview(1)", "Scroll", show=False),
         Binding("pageup", "scroll_preview(-1)", "Scroll up", show=False),
+        Binding("D,delete", "trash", "Trash"),
+        Binding("u", "undo_trash", "Undo trash"),
         Binding("r", "refresh", "Refresh"),
         Binding("left,h", "prev_tab", "Prev tab", show=False, priority=True),
         Binding("right,l", "next_tab", "Next tab", show=False, priority=True),
@@ -521,18 +547,20 @@ class GmailTUI(App):
         Binding("ctrl+c", "quit", "Quit", show=False, priority=True),
     ]
 
-    def __init__(self) -> None:
+    def __init__(self, creds=None) -> None:
         super().__init__()
         self.cfg = load_config()
         self.tabs = self.cfg.tabs
         self.backend = pick_backend(self.cfg)
         self.svc = None       # used only by the list-loading worker
-        self.creds = None
+        self.creds = creds
         self.pending_tid: str | None = None
         self.me = ""
         self.mails: list[Mail] = []
         self.ai_tabs: dict[str, str] = load_ai_cache(self.cfg)
         self.ai_pending: set[str] = set()
+        self.trashed: list[Mail] = []        # undo stack for D
+        self.shown_tid: str | None = None    # thread currently in the side panel
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -563,7 +591,7 @@ class GmailTUI(App):
     def load(self) -> None:
         try:
             if self.svc is None:
-                self.creds = gmail_creds()
+                self.creds = self.creds or gmail_creds(self.cfg.allow_changes)
                 self.svc = new_service(self.creds, timeout=30)
                 self.me = self.svc.users().getProfile(userId="me").execute()["emailAddress"].lower()
             mails = fetch_mails(self.svc, self.cfg.query, self.cfg.max_messages)
@@ -626,6 +654,7 @@ class GmailTUI(App):
         width = max(30, self.size.width - 40)
         for i, t in enumerate(self.tabs):
             table = self.query_one(f"#table{i}", DataTable)
+            keep_row = table.cursor_row  # refills (AI progress, delete) keep your place
             table.clear()
             for m in buckets[t.name]:
                 table.add_row(
@@ -635,6 +664,8 @@ class GmailTUI(App):
                     fmt_when(m.when),
                     key=m.thread_id,  # row key == Gmail thread id
                 )
+            if table.row_count:
+                table.move_cursor(row=min(keep_row, table.row_count - 1), animate=False)
             unread = sum(m.unread for m in buckets[t.name])
             label = f"{t.name} ({len(buckets[t.name])}" + (f", {unread}●)" if unread else ")")
             self.query_one(TabbedContent).get_tab(f"tab{i}").label = label
@@ -661,7 +692,10 @@ class GmailTUI(App):
         tid = tid or self._current_thread()
         if not tid or self.svc is None:
             return
-        self.query_one("#preview-pane").add_class("open")
+        pane = self.query_one("#preview-pane")
+        if pane.has_class("open") and tid in (self.shown_tid, self.pending_tid):
+            return  # already showing (or loading) this one
+        pane.add_class("open")
         self.query_one("#preview-head", Static).update("loading…")
         self.query_one("#preview-body", Static).update("")
         self.pending_tid = tid
@@ -691,6 +725,10 @@ class GmailTUI(App):
         if tid != self.pending_tid:  # stale result: the user has moved on, or it timed out
             return
         self.pending_tid = None
+        self.shown_tid = tid
+        mail = next((m for m in self.mails if m.thread_id == tid), None)
+        if self.cfg.allow_changes and mail and mail.unread and not header.startswith("Could not"):
+            self.mark_read(mail)
         # Text(...) so mail content is never parsed as Rich markup
         self.query_one("#preview-head", Static).update(Text(header))
         self.query_one("#preview-body", Static).update(Text(body))
@@ -698,6 +736,66 @@ class GmailTUI(App):
 
     def action_close_preview(self) -> None:
         self.query_one("#preview-pane").remove_class("open")
+        self.shown_tid = None
+
+    # ---- changes (only with allow_changes = true)
+
+    def _changes_allowed(self) -> bool:
+        if not self.cfg.allow_changes:
+            self.notify("Read-only: set allow_changes = true in your config to enable this.")
+        return self.cfg.allow_changes
+
+    @work(thread=True, group="changes")
+    def mark_read(self, mail: Mail) -> None:
+        try:
+            mark_thread_read(self._body_service(), mail.thread_id)
+        except Exception as e:
+            self.call_from_thread(self.notify, f"Could not mark read: {e}", severity="warning")
+            return
+        mail.labels.discard("UNREAD")
+        self.call_from_thread(self.fill, self.mails)
+
+    def action_trash(self) -> None:
+        tid = self._current_thread()
+        if not tid or not self._changes_allowed():
+            return
+        mail = next((m for m in self.mails if m.thread_id == tid), None)
+        if mail:
+            self.trash(mail)
+
+    @work(thread=True, group="changes")
+    def trash(self, mail: Mail) -> None:
+        try:
+            trash_thread(self._body_service(), mail.thread_id)
+        except Exception as e:
+            self.call_from_thread(self.notify, f"Could not move to Trash: {e}", severity="error")
+            return
+        self.trashed.append(mail)
+        self.call_from_thread(self._after_trash, mail)
+
+    def _after_trash(self, mail: Mail) -> None:
+        if self.shown_tid == mail.thread_id:
+            self.action_close_preview()
+        self.fill([m for m in self.mails if m.thread_id != mail.thread_id])
+        self.notify(f"Moved to Trash: {mail.subject[:60]}  (u to undo)")
+
+    def action_undo_trash(self) -> None:
+        if not self.trashed:
+            self.notify("Nothing to undo.")
+        elif self._changes_allowed():
+            self.untrash(self.trashed.pop())
+
+    @work(thread=True, group="changes")
+    def untrash(self, mail: Mail) -> None:
+        try:
+            untrash_thread(self._body_service(), mail.thread_id)
+        except Exception as e:
+            self.trashed.append(mail)
+            self.call_from_thread(self.notify, f"Could not undo: {e}", severity="error")
+            return
+        restored = sorted(self.mails + [mail], key=lambda m: m.when or datetime.min, reverse=True)
+        self.call_from_thread(self.fill, restored)
+        self.call_from_thread(self.notify, f"Restored: {mail.subject[:60]}")
 
     def action_scroll_preview(self, direction: int) -> None:
         pane = self.query_one("#preview-pane", VerticalScroll)
@@ -728,8 +826,11 @@ class GmailTUI(App):
 
 
 def main() -> None:
+    # Sign in before the TUI takes over the screen: a first sign-in (or one
+    # for broader access) opens a browser and prints a link.
+    creds = gmail_creds(load_config().allow_changes)
     try:
-        GmailTUI().run()  # restores the terminal when it returns
+        GmailTUI(creds).run()  # restores the terminal when it returns
     finally:
         for proc in list(CHILDREN):
             proc.kill()

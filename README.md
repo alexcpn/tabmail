@@ -15,8 +15,10 @@ There are no hard-coded sender lists or filters to maintain.
                                                                     │ Hi! Are you free…
 ```
 
-- **Read-only.** It uses the `gmail.readonly` scope, so it can't send, delete
-  or change anything, and reading an email here doesn't mark it as read.
+- **Read-only by default.** It uses the `gmail.readonly` scope, so it can't
+  send, delete or change anything. Set `allow_changes = true` to have opening
+  an email mark it read, and `D` move it to Trash (`u` undoes it). That asks
+  Google for `gmail.modify` instead. Mail is never deleted permanently or sent.
 - **Only sender and subject go to the AI**, never email bodies. Email text is
   passed as data, and the `claude` CLI runs with no tools.
 - **Each email is sorted once.** Results are cached per conversation, so a
@@ -29,7 +31,8 @@ There are no hard-coded sender lists or filters to maintain.
 1. In [Google Cloud Console](https://console.cloud.google.com/), create or pick a project.
 2. **APIs & Services → Library**: enable the **Gmail API**.
 3. **APIs & Services → OAuth consent screen**: choose External, add yourself
-   as a test user, and add the scope `.../auth/gmail.readonly`.
+   as a test user, and add the scope `.../auth/gmail.readonly` (plus
+   `.../auth/gmail.modify` if you'll use `allow_changes`).
 4. **APIs & Services → Credentials → Create credentials → OAuth client ID**:
    choose **Desktop app** and download the JSON file.
 5. Save it as `~/.config/gmail-tui/credentials.json`.
@@ -74,10 +77,12 @@ uv run gmail_tui.py
 | `PgDn/Space`, `PgUp` | scroll the side panel |
 | `Esc` | close the side panel |
 | `o` | open the email in Gmail |
+| `D` or `Delete` | move the conversation to Trash (needs `allow_changes = true`) |
+| `u` | undo the last move to Trash |
 | `r` | refresh |
 | `q` or `Ctrl+C` | quit |
 
-`●` means unread. The header shows how many conversations were loaded and which
+`●` means unread. With `allow_changes = true`, opening an email marks it read in Gmail. The header shows how many conversations were loaded and which
 AI backend is in use.
 
 ## Files

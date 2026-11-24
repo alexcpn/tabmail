@@ -157,3 +157,81 @@ def test_huge_body_is_truncated():
     _, body = g.fetch_body(_FakeSvc(msg), "t")
     assert len(body) < g.MAX_BODY_CHARS + 100
     assert body.endswith("open in Gmail)")
+
+
+# ---------------------------------------------------------------- UI (headless)
+
+import asyncio  # noqa: E402
+from datetime import datetime  # noqa: E402
+
+
+def _ui_app(monkeypatch, tmp_path, allow_changes):
+    cfg_file = tmp_path / "c.toml"
+    cfg_file.write_text(EXAMPLE.read_text().replace(
+        "allow_changes = false", f"allow_changes = {str(allow_changes).lower()}"))
+    monkeypatch.setenv("GMAIL_TUI_CONFIG", str(cfg_file))
+    monkeypatch.setattr(g, "AI_CACHE", tmp_path / "cache.json")
+    calls = []
+    monkeypatch.setattr(g, "fetch_body", lambda svc, tid: ("From: x", "body " + tid))
+    monkeypatch.setattr(g, "trash_thread", lambda svc, tid: calls.append(("trash", tid)))
+    monkeypatch.setattr(g, "untrash_thread", lambda svc, tid: calls.append(("untrash", tid)))
+    monkeypatch.setattr(g, "mark_thread_read", lambda svc, tid: calls.append(("read", tid)))
+    mails = [g.Mail(f"t{i}", f"P{i}", f"p{i}@gmail.com", f"S{i}", datetime(2026, 11, 20 - i),
+                    {"IMPORTANT", "UNREAD"}) for i in range(3)]
+
+    class T(g.GmailTUI):
+        def action_refresh(self):
+            self.svc = object()
+            self.backend = None
+            self.fill(list(mails))
+
+    return T(), calls
+
+
+def _rows(app):
+    t = app.query_one("#table0", g.DataTable)
+    return [t.coordinate_to_cell_key((r, 0)).row_key.value for r in range(t.row_count)]
+
+
+def test_trash_undo_and_mark_read(monkeypatch, tmp_path):
+    app, calls = _ui_app(monkeypatch, tmp_path, allow_changes=True)
+
+    async def run():
+        async with app.run_test(size=(140, 30)) as p:
+            await p.pause()
+            await p.press("enter"); await p.pause(0.3)
+            assert ("read", "t0") in calls                       # opening marks read
+            assert not next(m for m in app.mails if m.thread_id == "t0").unread
+            await p.press("down"); await p.pause(0.3)
+            await p.press("D"); await p.pause(0.3)
+            assert ("trash", "t1") in calls and _rows(app) == ["t0", "t2"]
+            assert app.query_one("#table0", g.DataTable).cursor_row == 1   # place kept
+            await p.press("u"); await p.pause(0.3)
+            assert ("untrash", "t1") in calls and _rows(app) == ["t0", "t1", "t2"]
+
+    asyncio.run(run())
+
+
+def test_read_only_mode_changes_nothing(monkeypatch, tmp_path):
+    app, calls = _ui_app(monkeypatch, tmp_path, allow_changes=False)
+
+    async def run():
+        async with app.run_test(size=(140, 30)) as p:
+            await p.pause()
+            await p.press("enter"); await p.pause(0.3)
+            await p.press("D"); await p.pause(0.3)
+            assert calls == [] and _rows(app) == ["t0", "t1", "t2"]
+
+    asyncio.run(run())
+
+
+def test_scope_choice(monkeypatch, tmp_path):
+    # a read-only token is not enough once allow_changes is on
+    monkeypatch.setattr(g, "TOKEN_FILE", tmp_path / "token.json")
+    monkeypatch.setattr(g, "CLIENT_SECRET", tmp_path / "missing.json")
+    (tmp_path / "token.json").write_text(
+        '{"token": "x", "refresh_token": "r", "client_id": "c", "client_secret": "s", '
+        '"scopes": ["https://www.googleapis.com/auth/gmail.readonly"], "expiry": "2999-01-01T00:00:00Z"}')
+    assert g.gmail_creds(allow_changes=False).token == "x"
+    with pytest.raises(SystemExit):          # needs a new sign-in -> no client secret here
+        g.gmail_creds(allow_changes=True)
