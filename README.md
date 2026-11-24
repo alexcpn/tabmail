@@ -96,6 +96,21 @@ uv run tabmail.py
 
 [uv](https://docs.astral.sh/uv/) installs the dependencies on the first run.
 
+### Start it from your app launcher
+
+```sh
+./install-launcher.sh
+```
+
+- **Linux:** adds tabmail to the app launcher. Press Super and type `tabmail`
+  or `mail`, and it opens in your default terminal.
+- **macOS:** creates `~/Applications/tabmail.app`, which opens Terminal running
+  tabmail. Press Cmd+Space and type `tabmail`; typing just `mail` finds Apple
+  Mail first.
+
+`./install-launcher.sh --uninstall` removes it. Re-run the installer if you
+move the tabmail folder.
+
 | Key | Action |
 |---|---|
 | `↑/↓` | move between emails (nothing is loaded until you press `Enter` or `s`) |
