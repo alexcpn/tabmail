@@ -67,14 +67,17 @@ Haiku (by default) sorts every email into one of those tabs.
 On the first run a browser window opens so you can sign in. The token is saved
 to `~/.config/tabmail/token.json` (mode 600).
 
-### 2. An AI backend (pick one)
+### 2. An AI backend
 
-| `ai =` | What it uses | Setup |
-|---|---|---|
-| `claude-cli` | the [Claude Code](https://claude.com/claude-code) CLI in headless mode (`claude -p`); it runs on whatever `claude` is logged in with, such as a Claude subscription | install `claude` and log in |
-| `anthropic-api` | the Anthropic API | `export ANTHROPIC_API_KEY=…` |
-| `auto` (default) | `claude-cli` if installed, else the API if a key is set | |
-| `off` | no AI; a simple fallback using Gmail's own labels | |
+**If you use [Claude Code](https://claude.com/claude-code) with a Claude
+subscription, there's nothing to do.** tabmail runs the `claude` CLI in headless
+mode (`claude -p`), so sorting and summaries use your existing login.
+
+| `ai =` | What it uses |
+|---|---|
+| `auto` (default) | the `claude` CLI, if it's installed |
+| `claude-cli` | the `claude` CLI, always |
+| `off` | no AI; a simple fallback using Gmail's own labels |
 
 ### 3. Your config
 
