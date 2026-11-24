@@ -1,6 +1,10 @@
 # tabmail
 
-A Gmail inbox for the terminal, sorted into tabs by an AI.
+Is your inbox out of control? Try tabmail: a dead-simple email viewer,
+sorted by common sense and a small AI.
+
+> For those who are comfortable with CLIs only! Built for people who'd rather
+> press keys than click. Tested with the Claude Code CLI.
 
 ## Why
 
