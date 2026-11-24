@@ -556,7 +556,7 @@ def test_resolve_auth(cfg, monkeypatch, tmp_path):
     assert g.resolve_auth(cfg) == "google-api"                 # explicit setting wins
 
 
-def test_imap_login_storage_falls_back_to_private_file(monkeypatch, tmp_path):
+def test_imap_login_never_written_to_a_file(monkeypatch, tmp_path):
     import builtins
     real_import = builtins.__import__
 
@@ -567,10 +567,11 @@ def test_imap_login_storage_falls_back_to_private_file(monkeypatch, tmp_path):
 
     monkeypatch.setattr(builtins, "__import__", no_keyring)
     monkeypatch.setattr(g, "CONFIG_DIR", tmp_path)
-    monkeypatch.setattr(g, "IMAP_FALLBACK_FILE", tmp_path / "imap.json")
     monkeypatch.delenv("TABMAIL_IMAP_USER", raising=False)
-    where = g.imap_save_login("a@gmail.com", "abcd")
-    assert where.endswith("imap.json") and oct((tmp_path / "imap.json").stat().st_mode)[-3:] == "600"
-    assert g.imap_saved_login() == ("a@gmail.com", "abcd")
-    g.imap_forget_login()
+    monkeypatch.delenv("TABMAIL_IMAP_PASSWORD", raising=False)
+    assert g.imap_save_login("a@gmail.com", "abcd") is False    # no keyring: not saved
+    assert list(tmp_path.iterdir()) == []                         # and nothing on disk
     assert g.imap_saved_login() is None
+    monkeypatch.setenv("TABMAIL_IMAP_USER", "a@gmail.com")
+    monkeypatch.setenv("TABMAIL_IMAP_PASSWORD", "abcd")
+    assert g.imap_saved_login() == ("a@gmail.com", "abcd")      # env vars still work

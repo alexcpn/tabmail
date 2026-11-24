@@ -666,7 +666,6 @@ def mark_thread_read(svc, thread_id: str) -> None:
 IMAP_HOST = "imap.gmail.com"
 KEYRING_SERVICE = "tabmail"
 KEYRING_ACCOUNT_KEY = "imap-account"   # keyring entry holding the Gmail address
-IMAP_FALLBACK_FILE = CONFIG_DIR / "imap.json"
 IMAP_BODY_BYTES = 2_000_000            # cap per message fetch (attachments can be huge)
 IMAP_HEADER_FIELDS = "FROM SUBJECT DATE LIST-UNSUBSCRIBE LIST-ID PRECEDENCE"
 _IMAP_LABELS = {"\\Inbox": "INBOX", "\\Important": "IMPORTANT", "\\Starred": "STARRED",
@@ -909,8 +908,8 @@ class ImapAccount:
 
 
 def imap_saved_login() -> tuple[str, str] | None:
-    """(address, app password) from env vars, the system keyring, or the
-    fallback file, in that order."""
+    """(address, app password) from env vars, else the system keyring.
+    The password is never written to a plain file."""
     user = os.environ.get("TABMAIL_IMAP_USER")
     pw = os.environ.get("TABMAIL_IMAP_PASSWORD")
     if user and pw:
@@ -922,30 +921,22 @@ def imap_saved_login() -> tuple[str, str] | None:
         pw = keyring.get_password(KEYRING_SERVICE, user) if user else None
         if user and pw:
             return user, pw
-    # No usable keyring backend: try the fallback file next.
-    except Exception:  # nosec B110
-        pass
-    try:
-        data = json.loads(IMAP_FALLBACK_FILE.read_text())
-        return data["email"], data["password"]
-    except (OSError, ValueError, KeyError):
+    except Exception:  # no usable keyring backend
         return None
+    return None
 
 
-def imap_save_login(user: str, pw: str) -> str:
-    """Store in the system keyring; if there is none, in a 0600 file."""
+def imap_save_login(user: str, pw: str) -> bool:
+    """Store in the system keyring. Returns False if there is no usable
+    keyring; the password is then kept for this session only."""
     try:
         import keyring
 
         keyring.set_password(KEYRING_SERVICE, KEYRING_ACCOUNT_KEY, user)
         keyring.set_password(KEYRING_SERVICE, user, pw)
-        return "your system keyring"
+        return True
     except Exception:
-        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        IMAP_FALLBACK_FILE.touch(mode=0o600)
-        IMAP_FALLBACK_FILE.chmod(0o600)
-        IMAP_FALLBACK_FILE.write_text(json.dumps({"email": user, "password": pw}))
-        return str(IMAP_FALLBACK_FILE)
+        return False
 
 
 def imap_forget_login() -> None:
@@ -956,10 +947,8 @@ def imap_forget_login() -> None:
         if saved:
             keyring.delete_password(KEYRING_SERVICE, saved[0])
         keyring.delete_password(KEYRING_SERVICE, KEYRING_ACCOUNT_KEY)
-    # Nothing stored in the keyring, or no keyring: still remove the file below.
-    except Exception:  # nosec B110
-        pass
-    IMAP_FALLBACK_FILE.unlink(missing_ok=True)
+    except Exception:  # nothing stored, or no keyring
+        return
 
 
 def imap_setup() -> ImapAccount:
@@ -969,7 +958,7 @@ def imap_setup() -> ImapAccount:
         "tabmail signs in to Gmail with an app password (no Google Cloud project needed).\n\n"
         "  1. Turn on 2-Step Verification:  https://myaccount.google.com/signinoptions/twosv\n"
         "  2. Create an app password named \"tabmail\":  https://myaccount.google.com/apppasswords\n"
-        "  3. Paste it below. It is stored in your system keyring, not in a plain file.\n"
+        "  3. Paste it below. It is saved in your system keyring, never in a plain file.\n"
     )
     for attempt in range(3):
         user = input("Gmail address: ").strip()
@@ -981,8 +970,13 @@ def imap_setup() -> ImapAccount:
             print(f"Could not sign in: {e}\n"
                   "Check the address and app password, and that IMAP is on in Gmail settings.\n")
             continue
-        where = imap_save_login(user, pw)
-        print(f"Signed in. Saved to {where}.\n")
+        if imap_save_login(user, pw):
+            print("Signed in. Saved in your system keyring.\n")
+        else:
+            print("Signed in for this session only: no system keyring was found, and tabmail\n"
+                  "won't write your password to a plain file. To stay signed in, install a\n"
+                  "keyring (e.g. gnome-keyring) or set TABMAIL_IMAP_USER and TABMAIL_IMAP_PASSWORD.\n")
+            input("Press Enter to continue.")
         return account
     raise SystemExit("Gave up after 3 attempts.")
 
