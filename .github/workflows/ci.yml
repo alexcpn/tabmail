@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 4 * * 1"   # weekly, to catch newly published vulnerabilities
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Run the offline test suite
+        run: >
+          uv run --python 3.12 --with pytest --with textual --with google-api-python-client
+          --with google-auth-oauthlib --with anthropic --with keyring
+          pytest -q tests
+
+  bandit:
+    name: Bandit (Python security lint)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uvx bandit -r tabmail.py
+
+  pip-audit:
+    name: pip-audit (known vulnerabilities in dependencies)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Pin the script's dependencies
+        run: uv export --script tabmail.py --no-hashes > requirements-audit.txt
+      - name: Audit them
+        run: uvx pip-audit -r requirements-audit.txt --disable-pip --no-deps
+
+  gitleaks:
+    name: Gitleaks (secrets in git history)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -32,7 +32,8 @@ import json
 import os
 import re
 import shutil
-import subprocess
+# subprocess is only used to run the `claude` CLI, with an argument list and no shell
+import subprocess  # nosec B404
 import sys
 import tomllib
 import webbrowser
@@ -264,8 +265,12 @@ CHILDREN: set[subprocess.Popen] = set()  # running `claude -p` calls, killed on 
 def _run_claude_cli(system: str, schema: dict, lines: str, model: str) -> dict:
     """Headless Claude Code: uses whatever `claude` is logged in with (e.g. a
     Claude subscription). No tools and no MCP servers, so email text is only data."""
-    proc = subprocess.Popen(
-        ["claude", "-p", "--model", model, "--tools", "", "--strict-mcp-config",
+    claude = shutil.which("claude")
+    if not claude:
+        raise RuntimeError("the claude CLI is not installed or not on PATH")
+    # Argument list, no shell: email text only ever reaches stdin, never a command line.
+    proc = subprocess.Popen(  # nosec B603
+        [claude, "-p", "--model", model, "--tools", "", "--strict-mcp-config",
          "--no-session-persistence", "--output-format", "json",
          "--system-prompt", system, "--json-schema", json.dumps(schema)],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
@@ -917,7 +922,8 @@ def imap_saved_login() -> tuple[str, str] | None:
         pw = keyring.get_password(KEYRING_SERVICE, user) if user else None
         if user and pw:
             return user, pw
-    except Exception:
+    # No usable keyring backend: try the fallback file next.
+    except Exception:  # nosec B110
         pass
     try:
         data = json.loads(IMAP_FALLBACK_FILE.read_text())
@@ -950,7 +956,8 @@ def imap_forget_login() -> None:
         if saved:
             keyring.delete_password(KEYRING_SERVICE, saved[0])
         keyring.delete_password(KEYRING_SERVICE, KEYRING_ACCOUNT_KEY)
-    except Exception:
+    # Nothing stored in the keyring, or no keyring: still remove the file below.
+    except Exception:  # nosec B110
         pass
     IMAP_FALLBACK_FILE.unlink(missing_ok=True)
 

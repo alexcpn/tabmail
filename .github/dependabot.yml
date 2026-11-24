@@ -1,0 +1,9 @@
+# Dependabot can't read the dependency list inside tabmail.py (PEP 723 script
+# metadata), so Python dependencies are checked by the pip-audit job in CI
+# instead. This keeps the GitHub Actions used by CI up to date.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
